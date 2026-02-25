@@ -19,10 +19,11 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-START_DATE = "2026-03-01"
-END_DATE   = "2026-12-31"
-INITIAL    = 1000  # $ per stock
-TOTAL_INV  = 4000  # $ total
+PREVIEW_START = "2026-01-01"   # Preview / warm-up period
+COMP_START    = "2026-03-01"   # Official competition start
+END_DATE      = "2026-12-31"
+INITIAL       = 1000  # $ per stock
+TOTAL_INV     = 4000  # $ total
 
 HUMAN_PARTICIPANTS = {
     "Singh":  ["MU",   "AAPL", "GLD",  "COST"],
@@ -184,65 +185,146 @@ div[data-testid="stMetric"] {
 # DATA FETCHING
 # ─────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_prices(tickers: list, start: str, end: str) -> pd.DataFrame:
+def fetch_prices(tickers: list, start: str, end: str):
     today = date.today().isoformat()
     actual_end = min(end, today)
-    
-    prices = pd.DataFrame()
+
+    # Clamp start — if start is in the future, pull back to today so we at least get something
+    if start > today:
+        start = today
+
     missing = []
-    
-    for ticker in tickers:
+    frames = {}
+
+    # Download all tickers at once for efficiency, fall back to individual if needed
+    try:
+        raw = yf.download(
+            tickers,
+            start=start,
+            end=actual_end,
+            auto_adjust=True,
+            progress=False,
+            group_by="ticker",
+            threads=True,
+        )
+    except Exception as e:
+        raw = pd.DataFrame()
+
+    if not raw.empty:
+        for ticker in tickers:
+            try:
+                if len(tickers) == 1:
+                    series = raw["Close"]
+                else:
+                    if ticker in raw.columns.get_level_values(0):
+                        series = raw[ticker]["Close"]
+                    else:
+                        missing.append(ticker)
+                        continue
+
+                if isinstance(series, pd.DataFrame):
+                    series = series.iloc[:, 0]
+                series = series.dropna()
+                if len(series) < 2:
+                    missing.append(ticker)
+                    continue
+                series.name = ticker
+                frames[ticker] = series
+            except Exception:
+                missing.append(ticker)
+    else:
+        missing = list(tickers)
+
+    # For any that failed in bulk, try individually
+    retry_missing = []
+    for ticker in missing:
         try:
             data = yf.download(ticker, start=start, end=actual_end,
                                auto_adjust=True, progress=False)
             if data.empty or len(data) < 2:
-                missing.append(ticker)
+                retry_missing.append(ticker)
                 continue
             close = data["Close"]
             if isinstance(close, pd.DataFrame):
                 close = close.iloc[:, 0]
+            close = close.dropna()
+            if len(close) < 2:
+                retry_missing.append(ticker)
+                continue
             close.name = ticker
-            prices = close.to_frame() if prices.empty else prices.join(close, how="outer")
+            frames[ticker] = close
         except Exception:
-            missing.append(ticker)
-    
-    if missing:
-        st.sidebar.warning(f"⚠️ Missing tickers (0% return assumed): {', '.join(missing)}")
-    
-    return prices, missing
+            retry_missing.append(ticker)
+
+    if not frames:
+        return pd.DataFrame(), list(tickers)
+
+    prices = pd.DataFrame(frames)
+    prices.index = pd.to_datetime(prices.index)
+    prices.sort_index(inplace=True)
+
+    if retry_missing:
+        st.sidebar.warning(f"⚠️ Missing tickers (0% return assumed): {', '.join(retry_missing)}")
+
+    return prices, retry_missing
 
 
-def compute_portfolio_values(prices: pd.DataFrame, participants: dict, missing_tickers: list) -> pd.DataFrame:
+def compute_portfolio_values(prices: pd.DataFrame, participants: dict, missing_tickers: list, anchor_date: str = COMP_START) -> pd.DataFrame:
     portfolios = {}
-    
+
+    # Find the actual anchor — first index on or after anchor_date
+    anchor_ts = pd.Timestamp(anchor_date)
+    available_dates = prices.index[prices.index >= anchor_ts]
+    if len(available_dates) == 0:
+        # Fallback: use first available date in data (preview mode before comp starts)
+        available_dates = prices.index
+    actual_anchor = available_dates[0]
+
     for name, tickers in participants.items():
         total = pd.Series(0.0, index=prices.index)
         for ticker in tickers:
             if ticker in prices.columns and ticker not in missing_tickers:
-                series = prices[ticker].fillna(method="ffill")
-                first_valid = series.first_valid_index()
-                if first_valid is None:
-                    total += INITIAL
-                    continue
-                ratio = series / series[first_valid]
+                series = prices[ticker].ffill()
+                anchor_price = series.get(actual_anchor, None)
+                if anchor_price is None or pd.isna(anchor_price):
+                    # find nearest valid price
+                    valid = series.dropna()
+                    if valid.empty:
+                        total += INITIAL
+                        continue
+                    anchor_price = valid.iloc[0]
+                ratio = series / anchor_price
                 total += ratio * INITIAL
             else:
                 total += INITIAL  # 0% return assumption
         portfolios[name] = total
-    
-    return pd.DataFrame(portfolios)
+
+    df = pd.DataFrame(portfolios)
+    # Only show data from anchor date onward in charts
+    return df[df.index >= actual_anchor]
 
 
-def compute_benchmark_values(prices: pd.DataFrame, missing_tickers: list) -> pd.DataFrame:
+def compute_benchmark_values(prices: pd.DataFrame, missing_tickers: list, anchor_date: str = COMP_START) -> pd.DataFrame:
+    anchor_ts = pd.Timestamp(anchor_date)
+    available_dates = prices.index[prices.index >= anchor_ts]
+    if len(available_dates) == 0:
+        available_dates = prices.index
+    actual_anchor = available_dates[0]
+
     benchmarks = {}
     for label, ticker in BENCHMARKS.items():
         if ticker in prices.columns and ticker not in missing_tickers:
-            series = prices[ticker].fillna(method="ffill")
-            first_valid = series.first_valid_index()
-            if first_valid:
-                ratio = series / series[first_valid]
-                benchmarks[label] = ratio * TOTAL_INV
-    return pd.DataFrame(benchmarks)
+            series = prices[ticker].ffill()
+            anchor_price = series.get(actual_anchor, None)
+            if anchor_price is None or pd.isna(anchor_price):
+                valid = series.dropna()
+                if valid.empty:
+                    continue
+                anchor_price = valid.iloc[0]
+            ratio = series / anchor_price
+            benchmarks[label] = ratio * TOTAL_INV
+    df = pd.DataFrame(benchmarks)
+    return df[df.index >= actual_anchor]
 
 
 # ─────────────────────────────────────────────
@@ -282,7 +364,7 @@ all_tickers = list(set(
 )) + list(BENCHMARKS.values())
 
 with st.spinner("📡 Fetching market data..."):
-    prices, missing_tickers = fetch_prices(all_tickers, START_DATE, END_DATE)
+    prices, missing_tickers = fetch_prices(all_tickers, PREVIEW_START, END_DATE)
 
 if prices.empty:
     st.error("Could not fetch any price data. Please check your internet connection.")
@@ -291,9 +373,16 @@ if prices.empty:
 # ─────────────────────────────────────────────
 # COMPUTE
 # ─────────────────────────────────────────────
-portfolio_df   = compute_portfolio_values(prices, active_participants, missing_tickers)
-benchmark_df   = compute_benchmark_values(prices, missing_tickers)
-all_portfolio  = compute_portfolio_values(prices, ALL_PARTICIPANTS, missing_tickers)
+today_str = date.today().isoformat()
+preview_mode = today_str < COMP_START
+
+# If competition hasn't started yet, anchor returns from Jan 1 (preview)
+# Once it starts, anchor from March 1
+anchor = PREVIEW_START if preview_mode else COMP_START
+
+portfolio_df   = compute_portfolio_values(prices, active_participants, missing_tickers, anchor_date=anchor)
+benchmark_df   = compute_benchmark_values(prices, missing_tickers, anchor_date=anchor)
+all_portfolio  = compute_portfolio_values(prices, ALL_PARTICIPANTS, missing_tickers, anchor_date=anchor)
 
 if portfolio_df.empty:
     st.error("No portfolio data could be computed.")
@@ -335,6 +424,14 @@ st.markdown("""
     </p>
 </div>
 """, unsafe_allow_html=True)
+
+if preview_mode:
+    st.info(
+        f"🔭 **Preview Mode** — Competition officially starts **March 1, 2026**. "
+        f"Showing pre-competition performance from Jan 1, 2026 ({today_str}) "
+        f"so you can verify everything is working correctly.",
+        icon="📅"
+    )
 
 # ─────────────────────────────────────────────
 # TABS
@@ -566,20 +663,28 @@ with tab4:
         tickers = active_participants[selected]
         part_type = "🤖 AI" if selected in AI_PARTICIPANTS else "👤 Human"
         
-        # Individual stock values
+        # Individual stock values — anchored same as main portfolio
+        anchor_ts_dd = pd.Timestamp(anchor)
+        avail_dd = prices.index[prices.index >= anchor_ts_dd]
+        actual_anchor_dd = avail_dd[0] if len(avail_dd) > 0 else prices.index[0]
+
         stock_vals = {}
         for ticker in tickers:
             if ticker in prices.columns and ticker not in missing_tickers:
-                series = prices[ticker].fillna(method="ffill")
-                fv = series.first_valid_index()
-                if fv:
-                    stock_vals[ticker] = (series / series[fv]) * INITIAL
+                series = prices[ticker].ffill()
+                ap = series.get(actual_anchor_dd) if actual_anchor_dd in series.index else None
+                if ap is None or pd.isna(ap):
+                    valid = series.dropna()
+                    ap = valid.iloc[0] if not valid.empty else None
+                if ap:
+                    stock_vals[ticker] = (series / ap) * INITIAL
                 else:
                     stock_vals[ticker] = pd.Series(INITIAL, index=prices.index)
             else:
                 stock_vals[ticker] = pd.Series(INITIAL, index=prices.index)
-        
+
         stock_df = pd.DataFrame(stock_vals)
+        stock_df = stock_df[stock_df.index >= actual_anchor_dd]
         
         # Summary metrics
         s_latest = stock_df.iloc[-1]
