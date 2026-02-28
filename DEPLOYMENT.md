@@ -51,7 +51,7 @@ Render will:
 
 This takes ~2–3 minutes. You'll get a live URL like:
 ```
-https://stock-championship-2026.onrender.com
+https://stock-comp-2026.onrender.com
 ```
 
 ---

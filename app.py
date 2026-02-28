@@ -19,8 +19,8 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-PREVIEW_START = "2026-01-01"   # Preview / warm-up period
-COMP_START    = "2026-03-01"   # Official competition start
+ANCHOR_DATE   = "2026-02-27"   # Prices locked to Feb 27, 2026 (last market close before comp)
+COMP_START    = "2026-03-01"   # Official competition start (display reference)
 END_DATE      = "2026-12-31"
 INITIAL       = 1000  # $ per stock
 TOTAL_INV     = 4000  # $ total
@@ -364,7 +364,7 @@ all_tickers = list(set(
 )) + list(BENCHMARKS.values())
 
 with st.spinner("📡 Fetching market data..."):
-    prices, missing_tickers = fetch_prices(all_tickers, PREVIEW_START, END_DATE)
+    prices, missing_tickers = fetch_prices(all_tickers, ANCHOR_DATE, END_DATE)
 
 if prices.empty:
     st.error("Could not fetch any price data. Please check your internet connection.")
@@ -374,11 +374,9 @@ if prices.empty:
 # COMPUTE
 # ─────────────────────────────────────────────
 today_str = date.today().isoformat()
-preview_mode = today_str < COMP_START
 
-# If competition hasn't started yet, anchor returns from Jan 1 (preview)
-# Once it starts, anchor from March 1
-anchor = PREVIEW_START if preview_mode else COMP_START
+# All returns are anchored to Feb 27, 2026 close prices (locked pre-competition baseline)
+anchor = ANCHOR_DATE
 
 portfolio_df   = compute_portfolio_values(prices, active_participants, missing_tickers, anchor_date=anchor)
 benchmark_df   = compute_benchmark_values(prices, missing_tickers, anchor_date=anchor)
@@ -420,18 +418,10 @@ st.markdown("""
     </h1>
     <p style="color:#4a5568;font-family:'Space Mono',monospace;font-size:12px;
               letter-spacing:3px;margin-top:8px;">
-        LIVE COMPETITION TRACKER
+        LIVE COMPETITION TRACKER · BASELINE: FEB 27, 2026
     </p>
 </div>
 """, unsafe_allow_html=True)
-
-if preview_mode:
-    st.info(
-        f"🔭 **Preview Mode** — Competition officially starts **March 1, 2026**. "
-        f"Showing pre-competition performance from Jan 1, 2026 ({today_str}) "
-        f"so you can verify everything is working correctly.",
-        icon="📅"
-    )
 
 # ─────────────────────────────────────────────
 # TABS
