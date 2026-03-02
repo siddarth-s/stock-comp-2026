@@ -182,21 +182,45 @@ div[data-testid="stMetric"] {
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────
-# DATA FETCHING
+# BASELINE PRICES  (locked Feb 27 4 PM close)
 # ─────────────────────────────────────────────
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_prices(tickers: list, start: str, end: str):
+@st.cache_data(show_spinner=False)
+def load_baseline() -> dict:
+    """
+    Load hard-coded Feb 27, 2026 regular-session close prices from
+    baseline_prices.json.  This file is generated ONCE by fetch_baseline.py
+    and then committed to the repo — it never changes.
+    """
+    import json
+    from pathlib import Path
+    baseline_path = Path(__file__).parent / "baseline_prices.json"
+    if not baseline_path.exists():
+        return {}
+    with open(baseline_path) as f:
+        data = json.load(f)
+    # Filter out None / missing values
+    return {k: v for k, v in data.get("prices", {}).items() if v is not None}
+
+
+# ─────────────────────────────────────────────
+# LIVE PRICE FETCHING  (daily history + latest,
+#   including pre/after-hours via prepost=True)
+# ─────────────────────────────────────────────
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_daily_history(tickers: tuple, start: str, end: str, _cache_bucket: int = 0):
+    """
+    Fetch daily OHLCV history for charting purposes (regular session only).
+    Returns a DataFrame of Close prices indexed by date, plus a list of
+    tickers that could not be fetched.
+    """
     today = date.today().isoformat()
     actual_end = min(end, today)
-
-    # Clamp start — if start is in the future, pull back to today so we at least get something
     if start > today:
         start = today
 
-    missing = []
     frames = {}
+    missing = []
 
-    # Download all tickers at once for efficiency, fall back to individual if needed
     try:
         raw = yf.download(
             tickers,
@@ -206,55 +230,43 @@ def fetch_prices(tickers: list, start: str, end: str):
             progress=False,
             group_by="ticker",
             threads=True,
+            prepost=False,   # daily history: regular session only
         )
-    except Exception as e:
+    except Exception:
         raw = pd.DataFrame()
 
-    if not raw.empty:
-        for ticker in tickers:
+    for ticker in tickers:
+        try:
+            if raw.empty:
+                raise ValueError("empty")
+            if len(tickers) == 1:
+                series = raw["Close"]
+            else:
+                if ticker not in raw.columns.get_level_values(0):
+                    raise ValueError("missing")
+                series = raw[ticker]["Close"]
+            if isinstance(series, pd.DataFrame):
+                series = series.iloc[:, 0]
+            series = series.dropna()
+            if len(series) < 1:
+                raise ValueError("too short")
+            series.name = ticker
+            frames[ticker] = series
+        except Exception:
+            # Individual fallback
             try:
-                if len(tickers) == 1:
-                    series = raw["Close"]
-                else:
-                    if ticker in raw.columns.get_level_values(0):
-                        series = raw[ticker]["Close"]
-                    else:
-                        missing.append(ticker)
-                        continue
-
-                if isinstance(series, pd.DataFrame):
-                    series = series.iloc[:, 0]
-                series = series.dropna()
-                if len(series) < 2:
-                    missing.append(ticker)
-                    continue
-                series.name = ticker
-                frames[ticker] = series
+                df2 = yf.download(ticker, start=start, end=actual_end,
+                                   auto_adjust=True, progress=False, prepost=False)
+                if df2.empty:
+                    raise ValueError("empty fallback")
+                c = df2["Close"]
+                if isinstance(c, pd.DataFrame):
+                    c = c.iloc[:, 0]
+                c = c.dropna()
+                c.name = ticker
+                frames[ticker] = c
             except Exception:
                 missing.append(ticker)
-    else:
-        missing = list(tickers)
-
-    # For any that failed in bulk, try individually
-    retry_missing = []
-    for ticker in missing:
-        try:
-            data = yf.download(ticker, start=start, end=actual_end,
-                               auto_adjust=True, progress=False)
-            if data.empty or len(data) < 2:
-                retry_missing.append(ticker)
-                continue
-            close = data["Close"]
-            if isinstance(close, pd.DataFrame):
-                close = close.iloc[:, 0]
-            close = close.dropna()
-            if len(close) < 2:
-                retry_missing.append(ticker)
-                continue
-            close.name = ticker
-            frames[ticker] = close
-        except Exception:
-            retry_missing.append(ticker)
 
     if not frames:
         return pd.DataFrame(), list(tickers)
@@ -262,69 +274,210 @@ def fetch_prices(tickers: list, start: str, end: str):
     prices = pd.DataFrame(frames)
     prices.index = pd.to_datetime(prices.index)
     prices.sort_index(inplace=True)
-
-    if retry_missing:
-        st.sidebar.warning(f"⚠️ Missing tickers (0% return assumed): {', '.join(retry_missing)}")
-
-    return prices, retry_missing
+    return prices, missing
 
 
-def compute_portfolio_values(prices: pd.DataFrame, participants: dict, missing_tickers: list, anchor_date: str = COMP_START) -> pd.DataFrame:
+
+def _do_fetch_latest_prices(tickers: tuple) -> tuple[dict, dict]:
+    """
+    Return the most recent available price for each ticker — including
+    after-hours and pre-market — exactly as Yahoo Finance displays it.
+
+    Strategy (in priority order, winner = highest unix timestamp):
+      1. fast_info attributes: postMarketPrice, preMarketPrice, regularMarketPrice
+         We collect ALL non-zero candidates with their unix timestamps and pick
+         the one with the most recent timestamp.
+      2. Fallback to history(1m, prepost=True) — captures AH/PM intraday bars.
+      3. Fallback to history(2m, prepost=True).
+      4. Fallback to history(1d) — last regular-session close.
+    """
+    import pytz
+    et_tz = pytz.timezone("US/Eastern")
+    current_prices: dict = {}
+    price_times:    dict = {}   # plain label strings
+
+    def _unix_to_label(ts_unix) -> str:
+        """Convert a unix timestamp (int or float) to a human-readable ET label."""
+        if not ts_unix:
+            return ""
+        dt_utc = datetime.fromtimestamp(float(ts_unix), tz=pytz.utc)
+        return dt_utc.astimezone(et_tz).strftime("%b %d, %Y %I:%M %p ET")
+
+    def _parse_history_latest(df) -> tuple:
+        """Extract (price, unix_ts, label) from the last row of a history DataFrame."""
+        if df is None or df.empty:
+            raise ValueError("empty")
+        close = df["Close"]
+        if isinstance(close, pd.DataFrame):
+            close = close.iloc[:, 0]
+        close = close.dropna()
+        if close.empty:
+            raise ValueError("all NaN")
+        price = float(close.iloc[-1])
+        ts = close.index[-1]
+        ts = pd.Timestamp(ts)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        unix_ts = ts.timestamp()
+        label = ts.astimezone(et_tz).strftime("%b %d, %Y %I:%M %p ET")
+        return price, unix_ts, label
+
+    for ticker in tickers:
+        price, label = None, "unavailable"
+        t = yf.Ticker(ticker)
+
+        # ── Strategy 1: ticker.info dict (most reliable for pre/post-market) ──
+        # .info carries postMarketPrice/Time, preMarketPrice/Time,
+        # regularMarketPrice/Time — the same values Yahoo Finance shows on-site.
+        # We collect all available (price, unix_ts, label_suffix) candidates,
+        # compare timestamps, and keep the MOST RECENT one.
+        try:
+            info = t.info
+            candidates = []  # list of (price, unix_ts, suffix)
+
+            po_p = info.get("postMarketPrice")
+            po_t = info.get("postMarketTime")
+            if po_p and float(po_p) > 0 and po_t:
+                candidates.append((float(po_p), float(po_t), "after-hours"))
+
+            pre_p = info.get("preMarketPrice")
+            pre_t = info.get("preMarketTime")
+            if pre_p and float(pre_p) > 0 and pre_t:
+                candidates.append((float(pre_p), float(pre_t), "pre-market"))
+
+            cur_p = info.get("currentPrice") or info.get("regularMarketPrice")
+            cur_t = info.get("regularMarketTime")
+            if cur_p and float(cur_p) > 0 and cur_t:
+                candidates.append((float(cur_p), float(cur_t), ""))
+
+            if candidates:
+                best = max(candidates, key=lambda x: x[1])
+                price = best[0]
+                suffix = f" ({best[2]})" if best[2] else ""
+                label = _unix_to_label(best[1]) + suffix
+        except Exception:
+            pass
+
+        # ── Strategy 1b: fast_info fallback for regular market price ──────────
+        # fast_info is much faster than .info; use it when .info fails entirely.
+        if price is None:
+            try:
+                fi = t.fast_info
+                reg_p = getattr(fi, "last_price", None)
+                reg_t = getattr(fi, "regular_market_time", None)
+                if reg_p and float(reg_p) > 0 and reg_t:
+                    price = float(reg_p)
+                    label = _unix_to_label(float(reg_t))
+            except Exception:
+                pass
+
+        # ── Strategy 2: 1-min bars with prepost=True ─────────────────────────
+        if price is None:
+            try:
+                h = t.history(period="5d", interval="1m", prepost=True, auto_adjust=True)
+                price, _, label = _parse_history_latest(h)
+            except Exception:
+                pass
+
+        # ── Strategy 3: 2-min bars with prepost=True ─────────────────────────
+        if price is None:
+            try:
+                h = t.history(period="5d", interval="2m", prepost=True, auto_adjust=True)
+                price, _, label = _parse_history_latest(h)
+            except Exception:
+                pass
+
+        # ── Strategy 4: daily bars (regular session) ──────────────────────────
+        if price is None:
+            try:
+                h = t.history(period="10d", interval="1d", prepost=False, auto_adjust=True)
+                price, _, label = _parse_history_latest(h)
+                label = label.replace(" ET", " ET (close)")
+            except Exception:
+                pass
+
+        current_prices[ticker] = price
+        price_times[ticker]    = label if price is not None else "unavailable"
+
+    return current_prices, price_times
+
+
+
+# ─────────────────────────────────────────────
+# PORTFOLIO COMPUTATION
+# ─────────────────────────────────────────────
+def compute_portfolio_history(
+    daily_prices: pd.DataFrame,
+    participants: dict,
+    baseline: dict,
+    missing_tickers: list,
+) -> pd.DataFrame:
+    """
+    Build a daily portfolio value series for each participant.
+    Each stock's daily value = (daily_close / baseline_price) * $1,000.
+    The baseline price is the locked Feb 27 4 PM close from baseline_prices.json.
+    """
     portfolios = {}
-
-    # Find the actual anchor — first index on or after anchor_date
-    anchor_ts = pd.Timestamp(anchor_date)
-    available_dates = prices.index[prices.index >= anchor_ts]
-    if len(available_dates) == 0:
-        # Fallback: use first available date in data (preview mode before comp starts)
-        available_dates = prices.index
-    actual_anchor = available_dates[0]
-
     for name, tickers in participants.items():
-        total = pd.Series(0.0, index=prices.index)
+        total = pd.Series(0.0, index=daily_prices.index)
         for ticker in tickers:
-            if ticker in prices.columns and ticker not in missing_tickers:
-                series = prices[ticker].ffill()
-                anchor_price = series.get(actual_anchor, None)
-                if anchor_price is None or pd.isna(anchor_price):
-                    # find nearest valid price
-                    valid = series.dropna()
-                    if valid.empty:
-                        total += INITIAL
-                        continue
-                    anchor_price = valid.iloc[0]
-                ratio = series / anchor_price
-                total += ratio * INITIAL
+            base = baseline.get(ticker)
+            if base and base > 0 and ticker in daily_prices.columns and ticker not in missing_tickers:
+                series = daily_prices[ticker].ffill()
+                total += (series / base) * INITIAL
             else:
-                total += INITIAL  # 0% return assumption
+                total += INITIAL   # flat $1,000 if ticker unavailable
         portfolios[name] = total
-
-    df = pd.DataFrame(portfolios)
-    # Only show data from anchor date onward in charts
-    return df[df.index >= actual_anchor]
+    return pd.DataFrame(portfolios)
 
 
-def compute_benchmark_values(prices: pd.DataFrame, missing_tickers: list, anchor_date: str = COMP_START) -> pd.DataFrame:
-    anchor_ts = pd.Timestamp(anchor_date)
-    available_dates = prices.index[prices.index >= anchor_ts]
-    if len(available_dates) == 0:
-        available_dates = prices.index
-    actual_anchor = available_dates[0]
+def compute_current_portfolio(
+    current_prices: dict,
+    participants: dict,
+    baseline: dict,
+) -> pd.Series:
+    """
+    Compute a single current portfolio value per participant using
+    live/after-hours prices from fast_info.
+    """
+    values = {}
+    for name, tickers in participants.items():
+        total = 0.0
+        for ticker in tickers:
+            base    = baseline.get(ticker)
+            current = current_prices.get(ticker)
+            if base and base > 0 and current and current > 0:
+                total += (current / base) * INITIAL
+            else:
+                total += INITIAL
+        values[name] = total
+    return pd.Series(values)
 
+
+def compute_benchmark_history(
+    daily_prices: pd.DataFrame,
+    baseline: dict,
+    missing_tickers: list,
+) -> pd.DataFrame:
     benchmarks = {}
     for label, ticker in BENCHMARKS.items():
-        if ticker in prices.columns and ticker not in missing_tickers:
-            series = prices[ticker].ffill()
-            anchor_price = series.get(actual_anchor, None)
-            if anchor_price is None or pd.isna(anchor_price):
-                valid = series.dropna()
-                if valid.empty:
-                    continue
-                anchor_price = valid.iloc[0]
-            ratio = series / anchor_price
-            benchmarks[label] = ratio * TOTAL_INV
-    df = pd.DataFrame(benchmarks)
-    return df[df.index >= actual_anchor]
+        base = baseline.get(ticker)
+        if base and base > 0 and ticker in daily_prices.columns and ticker not in missing_tickers:
+            series = daily_prices[ticker].ffill()
+            benchmarks[label] = (series / base) * TOTAL_INV
+    return pd.DataFrame(benchmarks)
+
+
+def compute_current_benchmarks(current_prices: dict, baseline: dict) -> pd.Series:
+    vals = {}
+    for label, ticker in BENCHMARKS.items():
+        base    = baseline.get(ticker)
+        current = current_prices.get(ticker)
+        if base and base > 0 and current and current > 0:
+            vals[label] = (current / base) * TOTAL_INV
+        else:
+            vals[label] = TOTAL_INV
+    return pd.Series(vals)
 
 
 # ─────────────────────────────────────────────
@@ -334,15 +487,15 @@ with st.sidebar:
     st.markdown("## 🏆 Championship 2026")
     st.markdown('<p style="color:#4a5568;font-size:12px;font-family:\'Space Mono\',monospace;">MAR 01 – DEC 31, 2026</p>', unsafe_allow_html=True)
     st.divider()
-    
+
     filter_opt = st.radio(
         "**Participant Filter**",
         ["All Participants", "Human Only", "AI Only"],
         index=0,
     )
-    
+
     st.divider()
-    st.markdown('<p style="color:#4a5568;font-size:11px;">Initial investment: $1,000 per stock<br>Total per portfolio: $4,000</p>', unsafe_allow_html=True)
+    st.markdown('<p style="color:#4a5568;font-size:11px;">Initial investment: $1,000 per stock<br>Total per portfolio: $4,000<br><br>Baseline: Feb 27, 2026 close<br>Live prices include after-hours</p>', unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────
@@ -357,42 +510,96 @@ else:
 
 
 # ─────────────────────────────────────────────
-# FETCH DATA
+# LOAD BASELINE + FETCH DATA
 # ─────────────────────────────────────────────
-all_tickers = list(set(
+all_tickers = sorted(set(
     t for p in ALL_PARTICIPANTS.values() for t in p
-)) + list(BENCHMARKS.values())
+) | set(BENCHMARKS.values()))
+
+_tickers_tuple = tuple(all_tickers)
+
+baseline = load_baseline()
+
+if not baseline:
+    st.error(
+        "**baseline_prices.json not found or empty.**\n\n"
+        "Run `python fetch_baseline.py` once locally, then commit "
+        "`baseline_prices.json` to your GitHub repo.",
+        icon="🔒",
+    )
+    st.stop()
+
+missing_from_baseline = [t for t in all_tickers if t not in baseline]
+if missing_from_baseline:
+    st.sidebar.warning(f"⚠️ No baseline price for: {', '.join(missing_from_baseline)} — 0% return assumed")
+
+# Fresh fetch on every page load — no caching layer for live prices.
+# Two bulk yf.download calls (2m + 1d) are fast enough (~3-5s total)
+# and guaranteed to return current data regardless of server state.
+_bucket_15min = int(datetime.now().timestamp() // 900)
 
 with st.spinner("📡 Fetching market data..."):
-    prices, missing_tickers = fetch_prices(all_tickers, ANCHOR_DATE, END_DATE)
+    daily_prices, missing_tickers = fetch_daily_history(
+        _tickers_tuple, ANCHOR_DATE, END_DATE, _cache_bucket=_bucket_15min
+    )
+    current_prices, price_times = _do_fetch_latest_prices(_tickers_tuple)
 
-if prices.empty:
-    st.error("Could not fetch any price data. Please check your internet connection.")
+if daily_prices.empty:
+    st.error("Could not fetch daily price history. Please check your internet connection.")
     st.stop()
 
 # ─────────────────────────────────────────────
-# COMPUTE
+# LAST UPDATED TIMESTAMP
+# ─────────────────────────────────────────────
+# Find the single most-recent timestamp across all tickers.
+# We parse the label strings back to datetimes for comparison,
+# falling back to string sort which works because of the format used.
+import pytz as _pytz
+
+def _parse_label_dt(label: str):
+    """Parse a price_times label string into a naive datetime for comparison."""
+    try:
+        # Strip suffixes like " ET", " ET (close)", " ET (after-hours)", etc.
+        clean = label.split(" ET")[0].strip()
+        return datetime.strptime(clean, "%b %d, %Y %I:%M %p")
+    except Exception:
+        return datetime.min
+
+_valid_times = {
+    tk: lbl for tk, lbl in price_times.items()
+    if lbl not in ("unavailable", "", None)
+}
+
+if _valid_times:
+    # Pick the label whose parsed datetime is the most recent
+    last_updated = max(_valid_times.values(), key=_parse_label_dt)
+else:
+    last_updated = "unavailable"
+
+# ─────────────────────────────────────────────
+# COMPUTE PORTFOLIO DATA
 # ─────────────────────────────────────────────
 today_str = date.today().isoformat()
 
-# All returns are anchored to Feb 27, 2026 close prices (locked pre-competition baseline)
-anchor = ANCHOR_DATE
-
-portfolio_df   = compute_portfolio_values(prices, active_participants, missing_tickers, anchor_date=anchor)
-benchmark_df   = compute_benchmark_values(prices, missing_tickers, anchor_date=anchor)
-all_portfolio  = compute_portfolio_values(prices, ALL_PARTICIPANTS, missing_tickers, anchor_date=anchor)
+# Daily history portfolios (for charts)
+portfolio_df  = compute_portfolio_history(daily_prices, active_participants, baseline, missing_tickers)
+benchmark_df  = compute_benchmark_history(daily_prices, baseline, missing_tickers)
+all_portfolio = compute_portfolio_history(daily_prices, ALL_PARTICIPANTS, baseline, missing_tickers)
 
 if portfolio_df.empty:
     st.error("No portfolio data could be computed.")
     st.stop()
 
-# Latest values & returns
-latest         = portfolio_df.iloc[-1]
-returns_pct    = ((latest - TOTAL_INV) / TOTAL_INV * 100).round(2)
-leaderboard    = pd.DataFrame({
-    "Participant":    latest.index,
-    "Portfolio ($)":  latest.values,
-    "Return (%)":     returns_pct.values,
+# Current (live) portfolio values using latest prices (incl. after-hours)
+current_portfolio  = compute_current_portfolio(current_prices, active_participants, baseline)
+current_benchmarks = compute_current_benchmarks(current_prices, baseline)
+
+# Build leaderboard from LIVE prices
+returns_pct = ((current_portfolio - TOTAL_INV) / TOTAL_INV * 100).round(2)
+leaderboard = pd.DataFrame({
+    "Participant":   current_portfolio.index,
+    "Portfolio ($)": current_portfolio.values,
+    "Return (%)":    returns_pct.values,
 }).sort_values("Portfolio ($)", ascending=False).reset_index(drop=True)
 leaderboard.index += 1
 leaderboard["Rank"] = leaderboard.index
@@ -409,7 +616,7 @@ colors = colors[:N]
 # TITLE
 # ─────────────────────────────────────────────
 st.markdown("""
-<div style="padding: 32px 0 16px 0;">
+<div style="padding: 32px 0 8px 0;">
     <h1 style="font-family:'Syne',sans-serif;font-size:40px;font-weight:800;
                background:linear-gradient(135deg,#e2e8f0,#63b3ed);
                -webkit-background-clip:text;-webkit-text-fill-color:transparent;
@@ -418,16 +625,48 @@ st.markdown("""
     </h1>
     <p style="color:#4a5568;font-family:'Space Mono',monospace;font-size:12px;
               letter-spacing:3px;margin-top:8px;">
-        LIVE COMPETITION TRACKER · BASELINE: FEB 27, 2026
+        LIVE COMPETITION TRACKER · BASELINE: FEB 27, 2026 CLOSE
     </p>
 </div>
 """, unsafe_allow_html=True)
 
+
+# Last updated notice
+st.markdown(
+    f"""<div style="display:inline-flex;align-items:center;gap:8px;
+                    background:rgba(99,179,237,0.07);border:1px solid rgba(99,179,237,0.15);
+                    border-radius:8px;padding:6px 14px;margin-bottom:4px;">
+        <span style="font-size:14px;">🕐</span>
+        <span style="font-family:'Space Mono',monospace;font-size:11px;color:#63b3ed;letter-spacing:1px;">
+            LATEST AVAILABLE PRICE: <strong>{last_updated}</strong>
+        </span>
+        <span style="font-family:'Space Mono',monospace;font-size:10px;color:#4a5568;">
+            &nbsp;· most recent trade per ticker — fetched fresh every page load
+        </span>
+    </div>""",
+    unsafe_allow_html=True,
+)
+
+# ── Debug expander ────────────────────────────────────────────────────────────
+with st.expander("🔬 Debug: raw price data per ticker", expanded=False):
+    st.caption(f"Server time (UTC): **{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}**")
+    _debug_rows = []
+    for _tk in sorted(current_prices.keys()):
+        _pt = price_times.get(_tk, "—")
+        _debug_rows.append({
+            "Ticker":    _tk,
+            "Price":     f"${current_prices[_tk]:,.4f}" if current_prices[_tk] else "None",
+            "Timestamp": _pt if isinstance(_pt, str) else str(_pt),
+        })
+    st.dataframe(pd.DataFrame(_debug_rows), use_container_width=True, hide_index=True)
+
+
 # ─────────────────────────────────────────────
 # TABS
 # ─────────────────────────────────────────────
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "🏆  Leaderboard",
+    "📈  Performance",
     "📊  Benchmarks",
     "📅  Monthly Breakdown",
     "🔍  Deep Dive",
@@ -458,24 +697,41 @@ with tab1:
             """, unsafe_allow_html=True)
     
     st.markdown('<div class="section-header">Full Leaderboard</div>', unsafe_allow_html=True)
-    
-    # Table
-    display_lb = leaderboard[["Rank","Type","Participant","Portfolio ($)","Return (%)"]].copy()
-    display_lb["Portfolio ($)"] = display_lb["Portfolio ($)"].map("${:,.2f}".format)
-    display_lb["Return (%)"]    = display_lb["Return (%)"].map("{:+.2f}%".format)
-    
-    st.dataframe(
-        display_lb,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Rank":          st.column_config.NumberColumn("Rank", width="small"),
-            "Type":          st.column_config.TextColumn("Type", width="small"),
-            "Participant":   st.column_config.TextColumn("Participant"),
-            "Portfolio ($)": st.column_config.TextColumn("Portfolio Value"),
-            "Return (%)":    st.column_config.TextColumn("Total Return"),
-        }
-    )
+
+    rows_html = ""
+    for _, row in leaderboard[["Rank", "Participant", "Portfolio ($)", "Return (%)", "Type"]].iterrows():
+        port_fmt = f"${row['Portfolio ($)']:,.2f}"
+        ret_fmt  = f"{row['Return (%)']:+.2f}%"
+        rc       = "#68d391" if row["Return (%)"] >= 0 else "#fc8181"
+        rows_html += f"""<tr style="border-bottom:1px solid rgba(255,255,255,0.04);">
+            <td style="width:36px;text-align:center;padding:10px 4px;color:#4a5568;">{int(row['Rank'])}</td>
+            <td style="padding:10px 12px;font-weight:600;color:#e2e8f0;">{row['Participant']}</td>
+            <td style="padding:10px 12px;font-family:'Space Mono',monospace;color:#63b3ed;">{port_fmt}</td>
+            <td style="padding:10px 12px;font-family:'Space Mono',monospace;color:{rc};font-weight:700;">{ret_fmt}</td>
+            <td style="padding:10px 12px;color:#718096;font-size:12px;">{row['Type']}</td>
+        </tr>"""
+
+    st.markdown(f"""
+    <div style="border:1px solid rgba(255,255,255,0.07);border-radius:12px;overflow:hidden;margin-bottom:8px;">
+    <table style="width:100%;border-collapse:collapse;font-family:'Syne',sans-serif;font-size:14px;">
+        <thead>
+            <tr style="background:rgba(255,255,255,0.04);border-bottom:1px solid rgba(255,255,255,0.08);">
+                <th style="width:36px;text-align:center;padding:10px 4px;color:#4a5568;
+                           font-family:'Space Mono',monospace;font-size:10px;letter-spacing:2px;font-weight:400;">#</th>
+                <th style="text-align:left;padding:10px 12px;color:#4a5568;
+                           font-family:'Space Mono',monospace;font-size:10px;letter-spacing:2px;font-weight:400;">PARTICIPANT</th>
+                <th style="text-align:left;padding:10px 12px;color:#4a5568;
+                           font-family:'Space Mono',monospace;font-size:10px;letter-spacing:2px;font-weight:400;">PORTFOLIO VALUE</th>
+                <th style="text-align:left;padding:10px 12px;color:#4a5568;
+                           font-family:'Space Mono',monospace;font-size:10px;letter-spacing:2px;font-weight:400;">TOTAL RETURN</th>
+                <th style="text-align:left;padding:10px 12px;color:#4a5568;
+                           font-family:'Space Mono',monospace;font-size:10px;letter-spacing:2px;font-weight:400;">TYPE</th>
+            </tr>
+        </thead>
+        <tbody>{rows_html}</tbody>
+    </table>
+    </div>
+    """, unsafe_allow_html=True)
     
     st.markdown('<div class="section-header">Portfolio Value Over Time</div>', unsafe_allow_html=True)
     
@@ -508,9 +764,132 @@ with tab1:
 
 
 # ══════════════════════════════════════════════
-# TAB 2: BENCHMARKS
+# TAB 2: PERFORMANCE
 # ══════════════════════════════════════════════
 with tab2:
+    # ── Cumulative % return over time (daily history) ─────────────────────
+    st.markdown('<div class="section-header">Cumulative Return Over Time</div>', unsafe_allow_html=True)
+
+    ret_df = ((portfolio_df - TOTAL_INV) / TOTAL_INV * 100).round(3)
+
+    fig_ret = go.Figure()
+    for i, col_name in enumerate(ret_df.columns):
+        fig_ret.add_trace(go.Scatter(
+            x=ret_df.index,
+            y=ret_df[col_name],
+            name=col_name,
+            line=dict(width=2, color=colors[i % len(colors)]),
+            hovertemplate=f"<b>{col_name}</b><br>%{{x|%b %d, %Y}}<br>Return: %{{y:+.2f}}%<extra></extra>",
+        ))
+
+    fig_ret.add_hline(y=0, line_dash="dot", line_color="rgba(255,255,255,0.18)",
+                      annotation_text="Baseline", annotation_position="bottom right",
+                      annotation_font_color="#4a5568")
+
+    fig_ret.update_layout(
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#a0aec0", family="Space Mono"),
+        legend=dict(bgcolor="rgba(0,0,0,0.3)", bordercolor="rgba(255,255,255,0.08)", borderwidth=1,
+                    orientation="v", x=1.01, y=1),
+        xaxis=dict(gridcolor="rgba(255,255,255,0.04)", showgrid=True, title="Date"),
+        yaxis=dict(gridcolor="rgba(255,255,255,0.05)", showgrid=True,
+                   ticksuffix="%", zeroline=False, title="Total Return"),
+        hovermode="x unified",
+        height=520,
+        margin=dict(l=0, r=120, t=20, b=0),
+    )
+    st.plotly_chart(fig_ret, use_container_width=True)
+
+    # ── Today's winner + daily return heatmap ─────────────────────────────
+    st.markdown('<div class="section-header">Today\'s Performance</div>', unsafe_allow_html=True)
+
+    # Compute today's return: compare live current_portfolio to yesterday's close
+    if len(portfolio_df) >= 2:
+        yesterday_close = portfolio_df.iloc[-1]   # last full daily close row
+        # live total return vs baseline for each participant
+        live_total_ret_pct = ((current_portfolio - TOTAL_INV) / TOTAL_INV * 100)
+        # yesterday's total return vs baseline
+        yest_total_ret_pct = ((yesterday_close - TOTAL_INV) / TOTAL_INV * 100)
+        # today's change = live return minus yesterday's closing return
+        todays_gain_pct    = (live_total_ret_pct - yest_total_ret_pct).round(3)
+    else:
+        # Not enough history — use live vs baseline directly
+        todays_gain_pct = ((current_portfolio - TOTAL_INV) / TOTAL_INV * 100).round(3)
+
+    # Today's winner
+    todays_winner      = todays_gain_pct.idxmax()
+    todays_winner_val  = todays_gain_pct.max()
+    todays_winner_type = "🤖 AI" if todays_winner in AI_PARTICIPANTS else "👤 Human"
+
+    w_col, spacer = st.columns([1, 2])
+    with w_col:
+        w_color = "#68d391" if todays_winner_val >= 0 else "#fc8181"
+        st.markdown(f"""
+        <div class="metric-card gold" style="text-align:center;">
+            <div class="metric-rank">🏅 TODAY'S LEADER</div>
+            <div class="metric-name">{todays_winner}</div>
+            <div class="metric-return" style="color:{w_color};font-size:26px;">{todays_winner_val:+.2f}%</div>
+            <div style="font-size:11px;color:#718096;margin-top:4px;">{todays_winner_type} · vs yesterday's close</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # Heatmap — single row showing today's % gain for every participant
+    sorted_today = todays_gain_pct.sort_values(ascending=False)
+    hm_vals  = sorted_today.values.reshape(1, -1)
+    hm_names = sorted_today.index.tolist()
+    hm_text  = [[f"{v:+.2f}%" for v in sorted_today.values]]
+
+    fig_hm = go.Figure(data=go.Heatmap(
+        z=hm_vals,
+        x=hm_names,
+        y=["Today's Return"],
+        colorscale=[
+            [0.0,  "#7b2d2d"],
+            [0.35, "#2d3748"],
+            [0.5,  "#1e2a3a"],
+            [0.65, "#2d3748"],
+            [1.0,  "#1a4731"],
+        ],
+        zmid=0,
+        text=hm_text,
+        texttemplate="%{text}",
+        textfont=dict(size=13, family="Space Mono", color="rgba(255,255,255,0.9)"),
+        hovertemplate="<b>%{x}</b><br>Today: %{z:+.3f}%<extra></extra>",
+        showscale=True,
+        colorbar=dict(
+            tickformat=".1f", ticksuffix="%", outlinewidth=0,
+            bgcolor="rgba(0,0,0,0)", tickfont=dict(family="Space Mono", size=10),
+        ),
+    ))
+    fig_hm.update_layout(
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#a0aec0", family="Space Mono", size=12),
+        height=160,
+        margin=dict(l=0, r=0, t=12, b=0),
+        xaxis=dict(side="bottom", tickangle=-30),
+        yaxis=dict(showticklabels=False),
+    )
+    st.plotly_chart(fig_hm, use_container_width=True)
+
+    # Full daily table
+    st.markdown('<div class="section-header">Full Today\'s Ranking</div>', unsafe_allow_html=True)
+    today_df = pd.DataFrame({
+        "Participant":    sorted_today.index,
+        "Today's Return": sorted_today.map("{:+.2f}%".format),
+        "Live Portfolio": current_portfolio[sorted_today.index].map("${:,.2f}".format),
+        "Type":           [("🤖 AI" if p in AI_PARTICIPANTS else "👤 Human") for p in sorted_today.index],
+    }).reset_index(drop=True)
+    today_df.index += 1
+    st.dataframe(today_df, use_container_width=True,
+                 column_config={"index": st.column_config.NumberColumn("#", width=40)})
+
+
+# ══════════════════════════════════════════════
+# TAB 3: BENCHMARKS
+# ══════════════════════════════════════════════
+with tab3:
     st.markdown('<div class="section-header">Portfolio vs Benchmarks</div>', unsafe_allow_html=True)
     
     avg_portfolio = portfolio_df.mean(axis=1)
@@ -547,23 +926,22 @@ with tab2:
     )
     st.plotly_chart(fig2, use_container_width=True)
     
-    # Benchmark stats
-    if not benchmark_df.empty:
-        st.markdown('<div class="section-header">Benchmark Performance</div>', unsafe_allow_html=True)
-        bm_latest = benchmark_df.iloc[-1]
-        bm_return = ((bm_latest - TOTAL_INV) / TOTAL_INV * 100).round(2)
-        bm_df = pd.DataFrame({
-            "Benchmark": bm_latest.index,
-            "Current Value": bm_latest.map("${:,.2f}".format),
-            "Return": bm_return.map("{:+.2f}%".format),
+    # Benchmark stats — use live prices
+    if len(current_benchmarks) > 0:
+        st.markdown('<div class="section-header">Benchmark Performance (Live)</div>', unsafe_allow_html=True)
+        bm_return = ((current_benchmarks - TOTAL_INV) / TOTAL_INV * 100).round(2)
+        bm_table = pd.DataFrame({
+            "Benchmark":     current_benchmarks.index,
+            "Current Value": current_benchmarks.map("${:,.2f}".format),
+            "Return":        bm_return.map("{:+.2f}%".format),
         })
-        st.dataframe(bm_df, use_container_width=True, hide_index=True)
+        st.dataframe(bm_table, use_container_width=True, hide_index=True)
 
 
 # ══════════════════════════════════════════════
-# TAB 3: MONTHLY BREAKDOWN
+# TAB 4: MONTHLY BREAKDOWN
 # ══════════════════════════════════════════════
-with tab3:
+with tab4:
     st.markdown('<div class="section-header">Monthly Performance</div>', unsafe_allow_html=True)
     
     # Resample to month-end
@@ -641,70 +1019,75 @@ with tab3:
 
 
 # ══════════════════════════════════════════════
-# TAB 4: INDIVIDUAL DEEP DIVE
+# TAB 5: INDIVIDUAL DEEP DIVE
 # ══════════════════════════════════════════════
-with tab4:
+with tab5:
     st.markdown('<div class="section-header">Individual Portfolio Analysis</div>', unsafe_allow_html=True)
-    
+
     participant_names = list(active_participants.keys())
     selected = st.selectbox("Select Participant", participant_names, key="deep_dive")
-    
+
     if selected:
-        tickers = active_participants[selected]
+        tickers   = active_participants[selected]
         part_type = "🤖 AI" if selected in AI_PARTICIPANTS else "👤 Human"
-        
-        # Individual stock values — anchored same as main portfolio
-        anchor_ts_dd = pd.Timestamp(anchor)
-        avail_dd = prices.index[prices.index >= anchor_ts_dd]
-        actual_anchor_dd = avail_dd[0] if len(avail_dd) > 0 else prices.index[0]
 
-        stock_vals = {}
+        # ── Build daily history for each stock (for charts) ──────────────────
+        stock_hist = {}
         for ticker in tickers:
-            if ticker in prices.columns and ticker not in missing_tickers:
-                series = prices[ticker].ffill()
-                ap = series.get(actual_anchor_dd) if actual_anchor_dd in series.index else None
-                if ap is None or pd.isna(ap):
-                    valid = series.dropna()
-                    ap = valid.iloc[0] if not valid.empty else None
-                if ap:
-                    stock_vals[ticker] = (series / ap) * INITIAL
-                else:
-                    stock_vals[ticker] = pd.Series(INITIAL, index=prices.index)
+            base = baseline.get(ticker)
+            if base and base > 0 and ticker in daily_prices.columns:
+                series = daily_prices[ticker].ffill()
+                stock_hist[ticker] = (series / base) * INITIAL
             else:
-                stock_vals[ticker] = pd.Series(INITIAL, index=prices.index)
+                stock_hist[ticker] = pd.Series(INITIAL, index=daily_prices.index)
+        stock_df = pd.DataFrame(stock_hist)
 
-        stock_df = pd.DataFrame(stock_vals)
-        stock_df = stock_df[stock_df.index >= actual_anchor_dd]
-        
-        # Summary metrics
-        s_latest = stock_df.iloc[-1]
+        # ── Current (live / after-hours) values for metric cards ─────────────
+        stock_colors_ind = ["#63b3ed", "#68d391", "#F6D860", "#fc8181"]
         col1, col2, col3, col4 = st.columns(4)
-        stock_colors_ind = ["#63b3ed","#68d391","#F6D860","#fc8181"]
-        
-        for i, (col, ticker) in enumerate(zip([col1,col2,col3,col4], tickers)):
-            val = s_latest.get(ticker, INITIAL)
-            ret = (val - INITIAL) / INITIAL * 100
-            ret_str = f"{ret:+.2f}%"
+
+        live_stock_vals = {}
+        for ticker in tickers:
+            base    = baseline.get(ticker)
+            current = current_prices.get(ticker)
+            if base and base > 0 and current and current > 0:
+                live_stock_vals[ticker] = (current / base) * INITIAL
+            else:
+                live_stock_vals[ticker] = INITIAL
+
+        for i, (col, ticker) in enumerate(zip([col1, col2, col3, col4], tickers)):
+            val      = live_stock_vals[ticker]
+            ret      = (val - INITIAL) / INITIAL * 100
+            ts       = price_times.get(ticker, "—")
+            base_px  = baseline.get(ticker)
+            curr_px  = current_prices.get(ticker)
             with col:
                 color = "#68d391" if ret >= 0 else "#fc8181"
+                base_str = f"${base_px:,.2f}" if base_px else "N/A"
+                curr_str = f"${curr_px:,.4f}" if curr_px else "N/A"
                 st.markdown(f"""
                 <div class="metric-card" style="border-top:3px solid {stock_colors_ind[i]};">
                     <div class="metric-rank">{ticker}</div>
                     <div class="metric-value" style="font-size:20px;">${val:,.2f}</div>
-                    <div class="metric-return" style="color:{color};">{ret_str}</div>
+                    <div class="metric-return" style="color:{color};">{ret:+.2f}%</div>
+                    <div style="margin-top:10px;font-family:'Space Mono',monospace;font-size:11px;color:#cbd5e0;line-height:2.0;">
+                        <span style="color:#718096;">BASE</span>&nbsp;&nbsp;{base_str}<br>
+                        <span style="color:#718096;">NOW&nbsp;</span>&nbsp;&nbsp;{curr_str}<br>
+                        <span style="color:#718096;font-size:10px;">{ts}</span>
+                    </div>
                 </div>
                 """, unsafe_allow_html=True)
-        
-        # Total
-        total_val = s_latest.sum()
+
+        # Total live portfolio value
+        total_val = sum(live_stock_vals.values())
         total_ret = (total_val - TOTAL_INV) / TOTAL_INV * 100
-        
+
         st.markdown(f"""
         <div style="text-align:center;margin:16px 0;padding:16px;
                     background:rgba(99,179,237,0.05);border-radius:12px;
                     border:1px solid rgba(99,179,237,0.15);">
             <span style="font-family:'Space Mono',monospace;color:#718096;font-size:12px;">
-                {selected} {part_type} — Total Portfolio
+                {selected} {part_type} — Total Portfolio (live)
             </span><br>
             <span style="font-family:'Space Mono',monospace;font-size:32px;
                          font-weight:700;color:#63b3ed;">${total_val:,.2f}</span>
@@ -782,8 +1165,9 @@ with tab4:
 # FOOTER
 # ─────────────────────────────────────────────
 st.markdown("---")
-st.markdown("""
+st.markdown(f"""
 <p style="text-align:center;color:#2d3748;font-family:'Space Mono',monospace;font-size:11px;letter-spacing:2px;">
-    STOCK MARKET CHAMPIONSHIP 2026 · DATA VIA YAHOO FINANCE · REFRESHES HOURLY
+    STOCK MARKET CHAMPIONSHIP 2026 · DATA VIA YAHOO FINANCE<br>
+    BASELINE: FEB 27, 2026 4:00 PM ET CLOSE · LIVE PRICES REFRESH EVERY 5 MIN · CHARTS REFRESH EVERY 15 MIN
 </p>
 """, unsafe_allow_html=True)

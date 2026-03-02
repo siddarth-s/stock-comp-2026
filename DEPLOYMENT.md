@@ -3,34 +3,57 @@
 
 ---
 
-### Step 1 — Prepare Your GitHub Repository
+### Step 1 — Generate the Locked Baseline Prices (run ONCE locally)
 
-1. Create a new GitHub repository (e.g., `stock-championship-2026`).
-2. Add the following files to the root of the repo:
-   ```
-   app.py
-   requirements.txt
-   ```
-3. Commit and push to `main`.
+Before deploying, you need to generate `baseline_prices.json` — the file that permanently stores every ticker's Feb 27, 2026 4:00 PM ET regular-session close price.
+
+```bash
+# Install dependencies locally first
+pip install -r requirements.txt
+
+# Run the one-time baseline fetcher
+python fetch_baseline.py
+```
+
+This will print each ticker and its locked price, then save `baseline_prices.json` in the same folder. **Verify the output looks correct** (all tickers have prices, no unexpected NULLs).
+
+> ⚠️ **Run this on or after March 1, 2026.** The Feb 27 trading session must have completed for the prices to be available via yfinance.
 
 ---
 
-### Step 2 — Create a Render Account
+### Step 2 — Prepare Your GitHub Repository
+
+Add **all four files** to the root of a new GitHub repo (e.g. `stock-comp-2026`):
+
+```
+app.py
+fetch_baseline.py
+baseline_prices.json     ← commit this after running Step 1
+requirements.txt
+```
+
+Commit and push to `main`.
+
+> **Important:** `baseline_prices.json` must be committed to the repo. Render has no persistent local storage, so if it's missing the app will show an error.
+
+---
+
+### Step 3 — Create a Render Account
 
 1. Go to [https://render.com](https://render.com) and sign up (free).
 2. Connect your GitHub account when prompted.
 
 ---
 
-### Step 3 — Create a New Web Service
+### Step 4 — Create a New Web Service
 
 1. On your Render Dashboard, click **"New +"** → **"Web Service"**.
-2. Select your GitHub repo (`stock-championship-2026`).
+2. Select your GitHub repo (`stock-comp-2026`).
 3. Fill in the settings:
 
 | Setting           | Value                                      |
 |-------------------|--------------------------------------------|
-| **Name**          | `stock-championship-2026` (or any name)    |
+| **Name**          | `stock-comp-2026`                          |
 | **Runtime**       | `Python 3`                                 |
 | **Region**        | Choose nearest to you                      |
 | **Branch**        | `main`                                     |
@@ -42,45 +65,43 @@
 
 ---
 
-### Step 4 — Wait for Deploy
+### Step 5 — Wait for Deploy
 
-Render will:
-1. Clone your repo
-2. Install dependencies (`pip install -r requirements.txt`)
-3. Start the Streamlit server
+Render will install dependencies and start the app. After ~2–3 minutes your dashboard will be live at:
 
-This takes ~2–3 minutes. You'll get a live URL like:
 ```
 https://stock-comp-2026.onrender.com
 ```
 
 ---
 
-### Step 5 — Keep It Alive (Optional — Free Tier Caveat)
+### Step 6 — Keep It Alive (Optional — Free Tier Caveat)
 
 Free Render services spin down after 15 minutes of inactivity. To prevent this:
 - Use a free uptime monitor like [UptimeRobot](https://uptimerobot.com)
-- Set it to ping your Render URL every 5 minutes
+- Set it to ping `https://stock-comp-2026.onrender.com` every 5 minutes
 
 ---
 
-### Notes
+### How the Price Architecture Works
 
-- **Data caching**: The app caches Yahoo Finance data for 1 hour using `@st.cache_data(ttl=3600)`. This avoids rate limits and speeds up repeated loads.
-- **Missing tickers**: If any ticker is delisted or unavailable (e.g., SNDK post-acquisition), the app assumes 0% return for that $1,000 slice and shows a warning in the sidebar.
-- **Competition start**: The app uses `2026-03-01` as the start date. All returns are calculated relative to the first available price on or after that date.
-- **Auto-refresh**: Streamlit doesn't auto-refresh by default. Users can manually refresh, or you can add `st_autorefresh` from `streamlit-extras` if desired.
+| Purpose | Source | Refresh |
+|---------|--------|---------|
+| **Baseline (anchor)** | `baseline_prices.json` — locked forever | Never re-fetched |
+| **Daily chart history** | `yf.download()` — regular session close | Every 15 min |
+| **Live leaderboard & cards** | `yf.Ticker.fast_info.last_price` — includes after-hours & pre-market | Every 5 min |
+
+The "last updated" timestamp shown in the app reflects when the live price quote was last retrieved, and will say e.g. `Mar 15, 2026 06:23 AM ET` during pre-market hours so users always know what they're looking at.
 
 ---
 
 ### Local Development
 
 ```bash
-# Install dependencies
 pip install -r requirements.txt
-
-# Run locally
+python fetch_baseline.py   # once only
 streamlit run app.py
 ```
 
-The app will open at `http://localhost:8501`.
+Opens at `http://localhost:8501`.
+
