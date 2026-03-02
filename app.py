@@ -18,6 +18,11 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# Deep Dive Selection State Initialization
+if "participant" in st.query_params:
+    st.session_state["deep_dive_selection"] = st.query_params["participant"]
+    del st.query_params["participant"]
+
 ANCHOR_DATE   = "2026-02-27"   # Prices locked to Feb 27, 2026 (last market close before comp)
 COMP_START    = "2026-03-01"   # Official competition start (display reference)
 END_DATE      = "2026-12-31"
@@ -100,6 +105,16 @@ html, body, [class*="css"] {
     font-weight: 800;
     color: #e2e8f0;
     margin-bottom: 4px;
+}
+
+.metric-name a {
+    color: inherit;
+    text-decoration: none;
+    transition: color 0.2s;
+}
+
+.metric-name a:hover {
+    color: #63b3ed;
 }
 
 .metric-value {
@@ -232,7 +247,6 @@ def fetch_daily_history(tickers: tuple, start: str, end: str, _cache_bucket: int
     prices.sort_index(inplace=True)
     return prices, missing
 
-# Added cache here so Deep Dive loads instantly
 @st.cache_data(ttl=300, show_spinner=False)
 def _do_fetch_latest_prices(tickers: tuple) -> tuple[dict, dict]:
     import pytz
@@ -376,8 +390,19 @@ if not baseline:
     st.error("**baseline_prices.json not found or empty.**")
     st.stop()
 
+# Dynamically patch baseline for any dynamically added tickers (like CRM)
 missing_from_baseline = [t for t in all_tickers if t not in baseline]
-if missing_from_baseline: st.sidebar.warning(f"⚠️ No baseline price for: {', '.join(missing_from_baseline)}")
+if missing_from_baseline:
+    try:
+        # Fetch up to Feb 28 to ensure we capture the Feb 27 close
+        missing_df, _ = fetch_daily_history(tuple(missing_from_baseline), ANCHOR_DATE, "2026-02-28", 0)
+        for t in missing_from_baseline:
+            if t in missing_df.columns and not missing_df.empty:
+                baseline[t] = float(missing_df[t].iloc[0])
+            elif len(missing_from_baseline) == 1 and not missing_df.empty:
+                baseline[t] = float(missing_df.iloc[0])
+    except Exception:
+        pass
 
 _bucket_15min = int(datetime.now().timestamp() // 900)
 
@@ -403,7 +428,6 @@ benchmark_df  = compute_benchmark_history(daily_prices, baseline, missing_ticker
 current_portfolio  = compute_current_portfolio(current_prices, active_participants, baseline)
 current_benchmarks = compute_current_benchmarks(current_prices, baseline)
 
-# Force live values into the historical dataframe to guarantee latest movement on charts
 live_timestamp = pd.Timestamp(datetime.now().replace(microsecond=0))
 chart_df = portfolio_df.copy()
 chart_df.loc[live_timestamp] = current_portfolio
@@ -480,26 +504,25 @@ with tab1:
             st.markdown(f"""
             <div class="metric-card {medals[i]}">
                 <div class="metric-rank">{medal_lbl[i]}</div>
-                <div class="metric-name">{row['Participant']}</div>
+                <div class="metric-name"><a href="?participant={row['Participant']}" target="_self">{row['Participant']}</a></div>
                 <div class="metric-value">${row['Portfolio ($)']:,.2f}</div>
                 <div class="metric-return {ret_color}">{ret_sign}{row['Return (%)']:.2f}%</div>
                 <div style="font-size:11px;color:#4a5568;margin-top:4px;">{row['Type']}</div>
             </div>
             """, unsafe_allow_html=True)
             
-    # Overall Heatmap (Request 1)
     st.markdown('<div class="section-header">Overall Performance</div>', unsafe_allow_html=True)
     sorted_overall = leaderboard.set_index("Participant")["Return (%)"].sort_values(ascending=False)
     hm_vals_ov = sorted_overall.values.reshape(1, -1)
     hm_names_ov = sorted_overall.index.tolist()
-    hm_text_ov = [[f"{v:+.2f}%" for v in sorted_overall.values]]
+    hm_text_ov = [[f"{v:+.1f}" for v in sorted_overall.values]]
 
     fig_hm_ov = go.Figure(data=go.Heatmap(
         z=hm_vals_ov, x=hm_names_ov, y=["Overall Return"],
         colorscale=[[0.0, "#7b2d2d"], [0.35, "#2d3748"], [0.5, "#1e2a3a"], [0.65, "#2d3748"], [1.0, "#1a4731"]],
         zmid=0, text=hm_text_ov, texttemplate="%{text}",
-        textfont=dict(size=13, family="Space Mono", color="rgba(255,255,255,0.9)"),
-        hovertemplate="<b>%{x}</b><br>Overall: %{z:+.3f}%<extra></extra>",
+        textfont=dict(size=10, family="Space Mono", color="rgba(255,255,255,0.9)"),
+        hovertemplate="<b>%{x}</b><br>Overall: %{z:+.2f}%<extra></extra>",
         showscale=True,
         colorbar=dict(tickformat=".1f", ticksuffix="%", outlinewidth=0, bgcolor="rgba(0,0,0,0)", tickfont=dict(family="Space Mono", size=10)),
     ))
@@ -542,7 +565,6 @@ with tab1:
     </div>
     """, unsafe_allow_html=True)
     
-    # Portfolio Value Over Time (Request 1 logic fix: use chart_df which forces recent data inclusion)
     st.markdown('<div class="section-header">Portfolio Value Over Time</div>', unsafe_allow_html=True)
     fig = go.Figure()
     for i, col_name in enumerate(chart_df.columns):
@@ -560,7 +582,6 @@ with tab1:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    # Cumulative Return Over Time Plot (Moved here, driven by chart_df)
     st.markdown('<div class="section-header">Total Return % Over Time</div>', unsafe_allow_html=True)
     ret_df = ((chart_df - TOTAL_INV) / TOTAL_INV * 100).round(3)
     fig_ret = go.Figure()
@@ -603,7 +624,7 @@ with tab2:
         st.markdown(f"""
         <div class="metric-card gold" style="text-align:center;">
             <div class="metric-rank">🏅 TODAY'S LEADER</div>
-            <div class="metric-name">{todays_winner}</div>
+            <div class="metric-name"><a href="?participant={todays_winner}" target="_self">{todays_winner}</a></div>
             <div class="metric-return" style="color:{w_color};font-size:26px;">{todays_winner_val:+.2f}%</div>
             <div style="font-size:11px;color:#718096;margin-top:4px;">{todays_winner_type} · vs yesterday's close</div>
         </div>
@@ -614,9 +635,9 @@ with tab2:
     fig_hm_daily = go.Figure(data=go.Heatmap(
         z=hm_vals, x=sorted_today.index.tolist(), y=["Today's Return"],
         colorscale=[[0.0, "#7b2d2d"], [0.35, "#2d3748"], [0.5, "#1e2a3a"], [0.65, "#2d3748"], [1.0, "#1a4731"]], zmid=0,
-        text=[[f"{v:+.2f}%" for v in sorted_today.values]], texttemplate="%{text}",
-        textfont=dict(size=13, family="Space Mono", color="rgba(255,255,255,0.9)"),
-        hovertemplate="<b>%{x}</b><br>Today: %{z:+.3f}%<extra></extra>", showscale=True,
+        text=[[f"{v:+.1f}" for v in sorted_today.values]], texttemplate="%{text}",
+        textfont=dict(size=10, family="Space Mono", color="rgba(255,255,255,0.9)"),
+        hovertemplate="<b>%{x}</b><br>Today: %{z:+.2f}%<extra></extra>", showscale=True,
         colorbar=dict(tickformat=".1f", ticksuffix="%", outlinewidth=0, bgcolor="rgba(0,0,0,0)", tickfont=dict(family="Space Mono", size=10)),
     ))
     fig_hm_daily.update_layout(plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", height=160, margin=dict(l=0, r=0, t=12, b=0), xaxis=dict(side="bottom", tickangle=-30), yaxis=dict(showticklabels=False))
@@ -634,13 +655,12 @@ with tab2:
 
 
 # ══════════════════════════════════════════════
-# TAB 3: MONTHLY LEADERBOARD (Request 3)
+# TAB 3: MONTHLY LEADERBOARD
 # ══════════════════════════════════════════════
 with tab3:
     st.markdown('<div class="section-header">Current Month Performance</div>', unsafe_allow_html=True)
     
     curr_mth_start = pd.Timestamp(date.today().replace(day=1))
-    # Grab the closest row before current month started to act as the base
     hist_before_mth = portfolio_df[portfolio_df.index < curr_mth_start]
     
     if len(hist_before_mth) > 0:
@@ -662,7 +682,7 @@ with tab3:
         st.markdown(f"""
         <div class="metric-card gold" style="text-align:center;">
             <div class="metric-rank">🏅 MONTH'S LEADER</div>
-            <div class="metric-name">{mtd_winner}</div>
+            <div class="metric-name"><a href="?participant={mtd_winner}" target="_self">{mtd_winner}</a></div>
             <div class="metric-return" style="color:{m_color};font-size:26px;">{mtd_winner_val:+.2f}%</div>
             <div style="font-size:11px;color:#718096;margin-top:4px;">{mtd_winner_type} · Month-To-Date</div>
         </div>
@@ -673,9 +693,9 @@ with tab3:
     fig_hm_mtd = go.Figure(data=go.Heatmap(
         z=hm_vals_mtd, x=sorted_mtd.index.tolist(), y=["MTD Return"],
         colorscale=[[0.0, "#7b2d2d"], [0.35, "#2d3748"], [0.5, "#1e2a3a"], [0.65, "#2d3748"], [1.0, "#1a4731"]], zmid=0,
-        text=[[f"{v:+.2f}%" for v in sorted_mtd.values]], texttemplate="%{text}",
-        textfont=dict(size=13, family="Space Mono", color="rgba(255,255,255,0.9)"),
-        hovertemplate="<b>%{x}</b><br>MTD: %{z:+.3f}%<extra></extra>", showscale=True,
+        text=[[f"{v:+.1f}" for v in sorted_mtd.values]], texttemplate="%{text}",
+        textfont=dict(size=10, family="Space Mono", color="rgba(255,255,255,0.9)"),
+        hovertemplate="<b>%{x}</b><br>MTD: %{z:+.2f}%<extra></extra>", showscale=True,
         colorbar=dict(tickformat=".1f", ticksuffix="%", outlinewidth=0, bgcolor="rgba(0,0,0,0)", tickfont=dict(family="Space Mono", size=10)),
     ))
     fig_hm_mtd.update_layout(plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", height=160, margin=dict(l=0, r=0, t=12, b=0), xaxis=dict(side="bottom", tickangle=-30), yaxis=dict(showticklabels=False))
@@ -697,9 +717,8 @@ with tab3:
 # ══════════════════════════════════════════════
 with tab4:
     st.markdown('<div class="section-header">Portfolio vs Benchmarks (% Return)</div>', unsafe_allow_html=True)
-    avg_portfolio = chart_df.mean(axis=1) # using the chart_df that includes current live prices
+    avg_portfolio = chart_df.mean(axis=1)
     
-    # Transform to percentage for better visibility (Request 4)
     avg_portfolio_pct = ((avg_portfolio - TOTAL_INV) / TOTAL_INV * 100).round(2)
     benchmark_df_live = compute_benchmark_history(daily_prices, baseline, missing_tickers)
     benchmark_df_live.loc[live_timestamp] = current_benchmarks
@@ -749,18 +768,17 @@ with tab4:
 with tab5:
     st.markdown('<div class="section-header">Monthly Performance</div>', unsafe_allow_html=True)
     
-    # Monthly breakdown logic fixed (Request 5)
     full_history = pd.concat([portfolio_df, pd.DataFrame([current_portfolio.values], columns=current_portfolio.index, index=[pd.Timestamp(datetime.now())])])
     monthly = full_history.resample("ME").last()
     
-    # We drop any index before March 1 since the competition didn't exist officially then 
-    # (Feb 27 is the baseline acting as Day 0, thus diffs starting March represent actual monthly gains)
     monthly_gain = monthly.diff().dropna() 
     monthly_pct  = (monthly_gain / monthly.shift(1).dropna() * 100).round(2)
     
-    # Only keep March onward
     monthly_pct = monthly_pct[monthly_pct.index >= pd.Timestamp("2026-03-01")]
     monthly_gain = monthly_gain[monthly_gain.index >= pd.Timestamp("2026-03-01")]
+    
+    # Sort alphabetically here for alphabetical output
+    monthly_pct = monthly_pct.reindex(sorted(monthly_pct.columns, key=lambda x: x.lower()), axis=1)
     
     if not monthly_gain.empty:
         months_fmt = monthly_pct.index.strftime("%b %Y")
@@ -802,7 +820,16 @@ with tab5:
 with tab6:
     st.markdown('<div class="section-header">Individual Portfolio Analysis</div>', unsafe_allow_html=True)
     participant_names = list(active_participants.keys())
-    selected = st.selectbox("Select Participant", participant_names, key="deep_dive")
+    
+    # Check session state populated by URL parameters for defaults
+    default_idx = 0
+    if "deep_dive_selection" in st.session_state and st.session_state["deep_dive_selection"] in participant_names:
+        default_idx = participant_names.index(st.session_state["deep_dive_selection"])
+        
+    selected = st.selectbox("Select Participant", participant_names, index=default_idx, key="deep_dive")
+    
+    # Sync choice backwards to session state
+    st.session_state["deep_dive_selection"] = selected
 
     if selected:
         tickers   = active_participants[selected]
@@ -817,7 +844,7 @@ with tab6:
             else:
                 stock_hist[ticker] = pd.Series(INITIAL, index=daily_prices.index)
         stock_df = pd.DataFrame(stock_hist)
-        # Push live price into stock_df for deep dive charting
+        
         live_hist_row = {}
         for tk in tickers:
             cp, bp = current_prices.get(tk), baseline.get(tk)
