@@ -62,122 +62,98 @@ BENCHMARKS = {
 ALL_PARTICIPANTS = {**HUMAN_PARTICIPANTS, **AI_PARTICIPANTS}
 
 # ─────────────────────────────────────────────
-# CUSTOM CSS
+# CUSTOM CSS & RESPONSIVE LOGIC
 # ─────────────────────────────────────────────
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;700;800&display=swap');
 
-html, body, [class*="css"] {
-    font-family: 'Syne', sans-serif;
-}
-
-.stApp {
-    background: linear-gradient(135deg, #0a0e1a 0%, #0d1526 50%, #0a1020 100%);
-}
+html, body, [class*="css"] { font-family: 'Syne', sans-serif; }
+.stApp { background: linear-gradient(135deg, #0a0e1a 0%, #0d1526 50%, #0a1020 100%); }
 
 .metric-card {
     background: linear-gradient(135deg, rgba(255,255,255,0.05) 0%, rgba(255,255,255,0.02) 100%);
-    border: 1px solid rgba(255,255,255,0.08);
-    border-radius: 16px;
-    padding: 24px;
-    text-align: center;
-    backdrop-filter: blur(10px);
-    transition: transform 0.2s, border-color 0.2s;
+    border: 1px solid rgba(255,255,255,0.08); border-radius: 16px; padding: 24px;
+    text-align: center; backdrop-filter: blur(10px); transition: transform 0.2s, border-color 0.2s;
 }
+.metric-card:hover { transform: translateY(-2px); border-color: rgba(99, 179, 237, 0.3); }
 
-.metric-card:hover {
-    transform: translateY(-2px);
-    border-color: rgba(99, 179, 237, 0.3);
-}
-
-.metric-rank {
-    font-family: 'Space Mono', monospace;
-    font-size: 11px;
-    letter-spacing: 3px;
-    color: #718096;
-    text-transform: uppercase;
-    margin-bottom: 8px;
-}
-
-.metric-name {
-    font-size: 22px;
-    font-weight: 800;
-    color: #e2e8f0;
-    margin-bottom: 4px;
-}
-
-.metric-name a {
-    color: inherit;
-    text-decoration: none;
-    transition: color 0.2s;
-}
-
-.metric-name a:hover {
-    color: #63b3ed;
-}
-
-.metric-value {
-    font-family: 'Space Mono', monospace;
-    font-size: 28px;
-    font-weight: 700;
-    color: #63b3ed;
-    margin-bottom: 4px;
-}
-
-.metric-return {
-    font-family: 'Space Mono', monospace;
-    font-size: 16px;
-    font-weight: 700;
-}
+.metric-rank { font-family: 'Space Mono', monospace; font-size: 11px; letter-spacing: 3px; color: #718096; text-transform: uppercase; margin-bottom: 8px; }
+.metric-name { font-size: 22px; font-weight: 800; color: #e2e8f0; margin-bottom: 4px; }
+.metric-name a { color: inherit; text-decoration: none; transition: color 0.2s; }
+.metric-name a:hover { color: #63b3ed; }
+.metric-value { font-family: 'Space Mono', monospace; font-size: 28px; font-weight: 700; color: #63b3ed; margin-bottom: 4px; }
+.metric-return { font-family: 'Space Mono', monospace; font-size: 16px; font-weight: 700; }
 
 .positive { color: #68d391; }
 .negative { color: #fc8181; }
-
 .gold   { border-top: 3px solid #F6D860; }
 .silver { border-top: 3px solid #C0C0C0; }
 .bronze { border-top: 3px solid #CD7F32; }
 
 .section-header {
-    font-family: 'Space Mono', monospace;
-    font-size: 11px;
-    letter-spacing: 4px;
-    text-transform: uppercase;
-    color: #4a5568;
-    margin: 32px 0 16px 0;
-    padding-bottom: 8px;
-    border-bottom: 1px solid rgba(255,255,255,0.06);
+    font-family: 'Space Mono', monospace; font-size: 11px; letter-spacing: 4px; text-transform: uppercase;
+    color: #4a5568; margin: 32px 0 16px 0; padding-bottom: 8px; border-bottom: 1px solid rgba(255,255,255,0.06);
 }
 
-section[data-testid="stSidebar"] {
-    background: rgba(10,14,26,0.95);
-    border-right: 1px solid rgba(255,255,255,0.06);
-}
-
-.stTabs [data-baseweb="tab-list"] {
-    gap: 4px;
-    background: rgba(255,255,255,0.03);
-    border-radius: 12px;
-    padding: 4px;
-}
-
-.stTabs [data-baseweb="tab"] {
-    border-radius: 8px;
-    font-family: 'Space Mono', monospace;
-    font-size: 12px;
-    letter-spacing: 1px;
-}
-
+section[data-testid="stSidebar"] { background: rgba(10,14,26,0.95); border-right: 1px solid rgba(255,255,255,0.06); }
+.stTabs [data-baseweb="tab-list"] { gap: 4px; background: rgba(255,255,255,0.03); border-radius: 12px; padding: 4px; }
+.stTabs [data-baseweb="tab"] { border-radius: 8px; font-family: 'Space Mono', monospace; font-size: 12px; letter-spacing: 1px; }
 .stDataFrame { border-radius: 12px; overflow: hidden; }
 
-div[data-testid="stMetric"] {
-    background: rgba(255,255,255,0.03);
-    border: 1px solid rgba(255,255,255,0.07);
-    border-radius: 12px;
-    padding: 16px;
+/* Responsive Plotly Container Logic (Safely hides respective containers via CSS sibling combinator) */
+@media (max-width: 768px) {
+    div[data-testid="stElementContainer"]:has(.hide-on-mobile),
+    div[data-testid="stElementContainer"]:has(.hide-on-mobile) + div[data-testid="stElementContainer"],
+    div.element-container:has(.hide-on-mobile),
+    div.element-container:has(.hide-on-mobile) + div.element-container { display: none !important; }
+}
+@media (min-width: 769px) {
+    div[data-testid="stElementContainer"]:has(.hide-on-desktop),
+    div[data-testid="stElementContainer"]:has(.hide-on-desktop) + div[data-testid="stElementContainer"],
+    div.element-container:has(.hide-on-desktop),
+    div.element-container:has(.hide-on-desktop) + div.element-container { display: none !important; }
 }
 </style>
 """, unsafe_allow_html=True)
+
+# Helper function to render desktop & mobile charts seamlessly side-by-side
+def render_responsive_plot(fig_desktop, fig_mobile):
+    st.markdown('<div class="hide-on-mobile" style="display:none;"></div>', unsafe_allow_html=True)
+    st.plotly_chart(fig_desktop, use_container_width=True)
+    
+    st.markdown('<div class="hide-on-desktop" style="display:none;"></div>', unsafe_allow_html=True)
+    st.plotly_chart(fig_mobile, use_container_width=True)
+
+# Helper function to transpose heatmaps into mobile vertical lists
+def create_mobile_heatmap(sorted_series, title):
+    hm_vals = sorted_series.values.reshape(-1, 1) # Transpose to N rows, 1 col
+    hm_names = sorted_series.index.tolist()
+    hm_text = [[f"{v:+.1f}%"] for v in sorted_series.values] # Bring back % sign since there's room now
+    
+    fig = go.Figure(data=go.Heatmap(
+        z=hm_vals, x=[title], y=hm_names,
+        colorscale=[[0.0, "#7b2d2d"], [0.35, "#2d3748"], [0.5, "#1e2a3a"], [0.65, "#2d3748"], [1.0, "#1a4731"]],
+        zmid=0, text=hm_text, texttemplate="%{text}",
+        textfont=dict(size=12, family="Space Mono", color="rgba(255,255,255,0.9)"),
+        hovertemplate="<b>%{y}</b><br>" + title + ": %{z:+.2f}%<extra></extra>",
+        showscale=False, # Hide scale block on mobile to save width
+    ))
+    fig.update_layout(
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+        height=max(300, 30 * len(sorted_series)), margin=dict(l=0, r=0, t=10, b=10),
+        xaxis=dict(side="top"), yaxis=dict(autorange="reversed") # Highest rank on top
+    )
+    return fig
+
+# Helper function to move legends to the bottom for mobile line charts
+def create_mobile_line_chart(fig_desktop):
+    fig_mobile = go.Figure(fig_desktop)
+    fig_mobile.update_layout(
+        legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5),
+        margin=dict(l=0, r=0, t=20, b=80) 
+    )
+    return fig_mobile
 
 # ─────────────────────────────────────────────
 # BASELINE PRICES
@@ -394,7 +370,6 @@ if not baseline:
 missing_from_baseline = [t for t in all_tickers if t not in baseline]
 if missing_from_baseline:
     try:
-        # Fetch up to Feb 28 to ensure we capture the Feb 27 close
         missing_df, _ = fetch_daily_history(tuple(missing_from_baseline), ANCHOR_DATE, "2026-02-28", 0)
         for t in missing_from_baseline:
             if t in missing_df.columns and not missing_df.empty:
@@ -513,26 +488,24 @@ with tab1:
             
     st.markdown('<div class="section-header">Overall Performance</div>', unsafe_allow_html=True)
     sorted_overall = leaderboard.set_index("Participant")["Return (%)"].sort_values(ascending=False)
+    
+    # Desktop Heatmap
     hm_vals_ov = sorted_overall.values.reshape(1, -1)
-    hm_names_ov = sorted_overall.index.tolist()
-    hm_text_ov = [[f"{v:+.1f}" for v in sorted_overall.values]]
-
     fig_hm_ov = go.Figure(data=go.Heatmap(
-        z=hm_vals_ov, x=hm_names_ov, y=["Overall Return"],
+        z=hm_vals_ov, x=sorted_overall.index.tolist(), y=["Overall Return"],
         colorscale=[[0.0, "#7b2d2d"], [0.35, "#2d3748"], [0.5, "#1e2a3a"], [0.65, "#2d3748"], [1.0, "#1a4731"]],
-        zmid=0, text=hm_text_ov, texttemplate="%{text}",
+        zmid=0, text=[[f"{v:+.1f}" for v in sorted_overall.values]], texttemplate="%{text}",
         textfont=dict(size=10, family="Space Mono", color="rgba(255,255,255,0.9)"),
         hovertemplate="<b>%{x}</b><br>Overall: %{z:+.2f}%<extra></extra>",
         showscale=True,
         colorbar=dict(tickformat=".1f", ticksuffix="%", outlinewidth=0, bgcolor="rgba(0,0,0,0)", tickfont=dict(family="Space Mono", size=10)),
     ))
     fig_hm_ov.update_layout(
-        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-        font=dict(color="#a0aec0", family="Space Mono", size=12),
-        height=160, margin=dict(l=0, r=0, t=12, b=0),
-        xaxis=dict(side="bottom", tickangle=-30), yaxis=dict(showticklabels=False),
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font=dict(color="#a0aec0", family="Space Mono", size=12),
+        height=160, margin=dict(l=0, r=0, t=12, b=0), xaxis=dict(side="bottom", tickangle=-30), yaxis=dict(showticklabels=False),
     )
-    st.plotly_chart(fig_hm_ov, use_container_width=True)
+    # Render Responsive pair
+    render_responsive_plot(fig_hm_ov, create_mobile_heatmap(sorted_overall, "Overall Return"))
 
     st.markdown('<div class="section-header">Full Leaderboard</div>', unsafe_allow_html=True)
     rows_html = ""
@@ -575,12 +548,12 @@ with tab1:
         ))
     fig.add_hline(y=TOTAL_INV, line_dash="dot", line_color="rgba(255,255,255,0.2)", annotation_text="Initial $4,000")
     fig.update_layout(
-        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-        font=dict(color="#a0aec0", family="Space Mono"), legend=dict(bgcolor="rgba(0,0,0,0.3)"),
-        xaxis=dict(gridcolor="rgba(255,255,255,0.04)"), yaxis=dict(gridcolor="rgba(255,255,255,0.04)", tickprefix="$"),
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font=dict(color="#a0aec0", family="Space Mono"), 
+        legend=dict(bgcolor="rgba(0,0,0,0.3)"), xaxis=dict(gridcolor="rgba(255,255,255,0.04)"), yaxis=dict(gridcolor="rgba(255,255,255,0.04)", tickprefix="$"),
         hovermode="x unified", height=450, margin=dict(l=0, r=0, t=20, b=0),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    # Both line charts rendered responsive (bottom legend on mobile)
+    render_responsive_plot(fig, create_mobile_line_chart(fig))
 
     st.markdown('<div class="section-header">Total Return % Over Time</div>', unsafe_allow_html=True)
     ret_df = ((chart_df - TOTAL_INV) / TOTAL_INV * 100).round(3)
@@ -598,7 +571,7 @@ with tab1:
         xaxis=dict(gridcolor="rgba(255,255,255,0.04)"), yaxis=dict(gridcolor="rgba(255,255,255,0.05)", ticksuffix="%"),
         hovermode="x unified", height=450, margin=dict(l=0, r=120, t=20, b=0),
     )
-    st.plotly_chart(fig_ret, use_container_width=True)
+    render_responsive_plot(fig_ret, create_mobile_line_chart(fig_ret))
 
 
 # ══════════════════════════════════════════════
@@ -631,9 +604,10 @@ with tab2:
         """, unsafe_allow_html=True)
 
     sorted_today = todays_gain_pct.sort_values(ascending=False)
-    hm_vals = sorted_today.values.reshape(1, -1)
+    
+    # Desktop
     fig_hm_daily = go.Figure(data=go.Heatmap(
-        z=hm_vals, x=sorted_today.index.tolist(), y=["Today's Return"],
+        z=sorted_today.values.reshape(1, -1), x=sorted_today.index.tolist(), y=["Today's Return"],
         colorscale=[[0.0, "#7b2d2d"], [0.35, "#2d3748"], [0.5, "#1e2a3a"], [0.65, "#2d3748"], [1.0, "#1a4731"]], zmid=0,
         text=[[f"{v:+.1f}" for v in sorted_today.values]], texttemplate="%{text}",
         textfont=dict(size=10, family="Space Mono", color="rgba(255,255,255,0.9)"),
@@ -641,7 +615,8 @@ with tab2:
         colorbar=dict(tickformat=".1f", ticksuffix="%", outlinewidth=0, bgcolor="rgba(0,0,0,0)", tickfont=dict(family="Space Mono", size=10)),
     ))
     fig_hm_daily.update_layout(plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", height=160, margin=dict(l=0, r=0, t=12, b=0), xaxis=dict(side="bottom", tickangle=-30), yaxis=dict(showticklabels=False))
-    st.plotly_chart(fig_hm_daily, use_container_width=True)
+    
+    render_responsive_plot(fig_hm_daily, create_mobile_heatmap(sorted_today, "Today's Return"))
 
     st.markdown('<div class="section-header">Full Today\'s Ranking</div>', unsafe_allow_html=True)
     today_df = pd.DataFrame({
@@ -689,9 +664,10 @@ with tab3:
         """, unsafe_allow_html=True)
 
     sorted_mtd = mtd_gain_pct.sort_values(ascending=False)
-    hm_vals_mtd = sorted_mtd.values.reshape(1, -1)
+    
+    # Desktop
     fig_hm_mtd = go.Figure(data=go.Heatmap(
-        z=hm_vals_mtd, x=sorted_mtd.index.tolist(), y=["MTD Return"],
+        z=sorted_mtd.values.reshape(1, -1), x=sorted_mtd.index.tolist(), y=["MTD Return"],
         colorscale=[[0.0, "#7b2d2d"], [0.35, "#2d3748"], [0.5, "#1e2a3a"], [0.65, "#2d3748"], [1.0, "#1a4731"]], zmid=0,
         text=[[f"{v:+.1f}" for v in sorted_mtd.values]], texttemplate="%{text}",
         textfont=dict(size=10, family="Space Mono", color="rgba(255,255,255,0.9)"),
@@ -699,7 +675,8 @@ with tab3:
         colorbar=dict(tickformat=".1f", ticksuffix="%", outlinewidth=0, bgcolor="rgba(0,0,0,0)", tickfont=dict(family="Space Mono", size=10)),
     ))
     fig_hm_mtd.update_layout(plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", height=160, margin=dict(l=0, r=0, t=12, b=0), xaxis=dict(side="bottom", tickangle=-30), yaxis=dict(showticklabels=False))
-    st.plotly_chart(fig_hm_mtd, use_container_width=True)
+    
+    render_responsive_plot(fig_hm_mtd, create_mobile_heatmap(sorted_mtd, "MTD Return"))
 
     st.markdown('<div class="section-header">Full MTD Ranking</div>', unsafe_allow_html=True)
     mtd_df = pd.DataFrame({
@@ -746,7 +723,9 @@ with tab4:
         xaxis=dict(gridcolor="rgba(255,255,255,0.04)"), yaxis=dict(gridcolor="rgba(255,255,255,0.04)", ticksuffix="%"),
         hovermode="x unified", height=500, margin=dict(l=0, r=0, t=20, b=0),
     )
-    st.plotly_chart(fig2, use_container_width=True)
+    
+    # Render Responsive
+    render_responsive_plot(fig2, create_mobile_line_chart(fig2))
     
     if len(current_benchmarks) > 0:
         st.markdown('<div class="section-header">Benchmark Performance (Live)</div>', unsafe_allow_html=True)
@@ -777,7 +756,6 @@ with tab5:
     monthly_pct = monthly_pct[monthly_pct.index >= pd.Timestamp("2026-03-01")]
     monthly_gain = monthly_gain[monthly_gain.index >= pd.Timestamp("2026-03-01")]
     
-    # Sort alphabetically here for alphabetical output
     monthly_pct = monthly_pct.reindex(sorted(monthly_pct.columns, key=lambda x: x.lower()), axis=1)
     
     if not monthly_gain.empty:
@@ -821,14 +799,11 @@ with tab6:
     st.markdown('<div class="section-header">Individual Portfolio Analysis</div>', unsafe_allow_html=True)
     participant_names = list(active_participants.keys())
     
-    # Check session state populated by URL parameters for defaults
     default_idx = 0
     if "deep_dive_selection" in st.session_state and st.session_state["deep_dive_selection"] in participant_names:
         default_idx = participant_names.index(st.session_state["deep_dive_selection"])
         
     selected = st.selectbox("Select Participant", participant_names, index=default_idx, key="deep_dive")
-    
-    # Sync choice backwards to session state
     st.session_state["deep_dive_selection"] = selected
 
     if selected:
