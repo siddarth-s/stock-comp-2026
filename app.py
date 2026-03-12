@@ -449,16 +449,62 @@ with _loading_container.container():
     """.replace("{len(_tickers_tuple)}", str(len(_tickers_tuple))), unsafe_allow_html=True)
     _progress_bar = st.progress(0, text="Fetching daily price history…")
 
-    # Step 1: Daily history (bulk download — fast)
-    daily_prices, missing_tickers = fetch_daily_history(
-        _tickers_tuple, ANCHOR_DATE, END_DATE,
-        _cache_bucket=int(datetime.now().timestamp() // 900)
-    )
+    import threading, time
+
+    # Step 1: Daily history (bulk download) — animate 0% → 30%
+    _hist_done = threading.Event()
+    _hist_result = {}
+
+    def _bg_hist():
+        _hist_result["prices"], _hist_result["missing"] = fetch_daily_history(
+            _tickers_tuple, ANCHOR_DATE, END_DATE,
+            _cache_bucket=int(datetime.now().timestamp() // 900)
+        )
+        _hist_done.set()
+
+    threading.Thread(target=_bg_hist, daemon=True).start()
+
+    _pct = 0
+    while not _hist_done.is_set():
+        _hist_done.wait(timeout=0.15)
+        if _pct < 28:
+            _pct = min(_pct + 1, 28)
+            _progress_bar.progress(_pct, text=f"Fetching daily price history… {_pct}%")
+
+    daily_prices, missing_tickers = _hist_result["prices"], _hist_result["missing"]
+
+    # Ramp to 30%
+    for _p in range(_pct + 1, 31):
+        _progress_bar.progress(_p, text=f"Daily history loaded… {_p}%")
+        time.sleep(0.01)
+    _pct = 30
     _progress_bar.progress(30, text="Daily history loaded. Fetching live prices…")
 
-    # Step 2: Live prices (parallelized)
-    current_prices, price_times = _do_fetch_latest_prices(_tickers_tuple)
+    # Step 2: Live prices (parallelized) — animate 30% → 95%
+    _fetch_done = threading.Event()
+    _fetch_result = {}
+
+    def _bg_fetch():
+        _fetch_result["prices"], _fetch_result["times"] = _do_fetch_latest_prices(_tickers_tuple)
+        _fetch_done.set()
+
+    threading.Thread(target=_bg_fetch, daemon=True).start()
+
+    while not _fetch_done.is_set():
+        _fetch_done.wait(timeout=0.15)
+        if _pct < 95:
+            _pct = min(_pct + 1, 95)
+            _progress_bar.progress(_pct, text=f"Fetching live prices… {_pct}%")
+
+    current_prices, price_times = _fetch_result["prices"], _fetch_result["times"]
+
+    # Ramp to 100%
+    for _p in range(_pct + 1, 101):
+        _progress_bar.progress(_p, text=f"Finalizing… {_p}%")
+        time.sleep(0.01)
+
     _progress_bar.progress(100, text="✅ All data loaded!")
+    time.sleep(0.8)
 
 _loading_container.empty()
 
