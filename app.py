@@ -601,6 +601,7 @@ with tab1:
     st.markdown('<div class="section-header">Full Leaderboard</div>', unsafe_allow_html=True)
     
     formatted_leaderboard = leaderboard[["Rank", "Participant", "Portfolio ($)", "Return (%)", "Type"]].copy()
+    formatted_leaderboard["Participant"] = formatted_leaderboard["Participant"].map(lambda x: f'<a href="?participant={x}" target="_self" style="color:var(--text-main);text-decoration:none;font-weight:700;transition:color 0.2s;" onmouseover="this.style.color=\'var(--text-value)\'" onmouseout="this.style.color=\'var(--text-main)\'">{x}</a>')
     formatted_leaderboard["Portfolio ($)"] = formatted_leaderboard["Portfolio ($)"].map("${:,.2f}".format)
     formatted_leaderboard["Return (%)"] = formatted_leaderboard["Return (%)"].map("{:+.2f}%".format)
     st.markdown(create_html_table(formatted_leaderboard), unsafe_allow_html=True)
