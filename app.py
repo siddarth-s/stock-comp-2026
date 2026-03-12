@@ -5,6 +5,7 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import date, datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -300,7 +301,7 @@ def fetch_daily_history(tickers: tuple, start: str, end: str, _cache_bucket: int
     return prices, missing
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _do_fetch_latest_prices(tickers: tuple) -> tuple[dict, dict]:
+def _do_fetch_latest_prices(tickers: tuple, _progress_placeholder=None) -> tuple[dict, dict]:
     import pytz
     et_tz = pytz.timezone("US/Eastern")
     current_prices, price_times = {}, {}
@@ -321,7 +322,7 @@ def _do_fetch_latest_prices(tickers: tuple) -> tuple[dict, dict]:
         if ts.tzinfo is None: ts = ts.tz_localize("UTC")
         return price, ts.timestamp(), ts.astimezone(et_tz).strftime("%b %d, %Y %I:%M %p ET")
 
-    for ticker in tickers:
+    def _fetch_single_ticker(ticker):
         price, label = None, "unavailable"
         t = yf.Ticker(ticker)
         try:
@@ -353,8 +354,17 @@ def _do_fetch_latest_prices(tickers: tuple) -> tuple[dict, dict]:
                 label = label.replace(" ET", " ET (close)")
             except Exception: pass
 
-        current_prices[ticker] = price
-        price_times[ticker] = label if price is not None else "unavailable"
+        return ticker, price, label if price is not None else "unavailable"
+
+    total = len(tickers)
+    completed = 0
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        futures = {executor.submit(_fetch_single_ticker, t): t for t in tickers}
+        for future in as_completed(futures):
+            ticker, price, label = future.result()
+            current_prices[ticker] = price
+            price_times[ticker] = label
+            completed += 1
 
     return current_prices, price_times
 
@@ -420,9 +430,35 @@ if missing_from_baseline:
             elif len(missing_from_baseline) == 1 and not missing_df.empty: baseline[t] = float(missing_df.iloc[0])
     except Exception: pass
 
-with st.spinner("📡 Fetching market data..."):
-    daily_prices, missing_tickers = fetch_daily_history(_tickers_tuple, ANCHOR_DATE, END_DATE, _cache_bucket=int(datetime.now().timestamp() // 900))
+# ─── Loading UI ───
+_loading_container = st.empty()
+with _loading_container.container():
+    st.markdown("""
+    <div style="background:var(--card-bg);border:1px solid var(--card-border);border-radius:16px;
+                padding:32px;text-align:center;margin:20px 0;backdrop-filter:blur(10px);">
+        <div style="font-family:'Space Mono',monospace;font-size:11px;letter-spacing:4px;
+                    color:var(--text-muted);text-transform:uppercase;margin-bottom:12px;">📡 Loading Market Data</div>
+        <div style="font-family:'Syne',sans-serif;font-size:22px;font-weight:700;
+                    color:var(--text-main);margin-bottom:4px;">Fetching live prices…</div>
+        <div style="font-family:'Space Mono',monospace;font-size:12px;color:var(--text-muted);">
+            Downloading data for <strong>{len(_tickers_tuple)}</strong> tickers
+        </div>
+    </div>
+    """.replace("{len(_tickers_tuple)}", str(len(_tickers_tuple))), unsafe_allow_html=True)
+    _progress_bar = st.progress(0, text="Fetching daily price history…")
+
+    # Step 1: Daily history (bulk download — fast)
+    daily_prices, missing_tickers = fetch_daily_history(
+        _tickers_tuple, ANCHOR_DATE, END_DATE,
+        _cache_bucket=int(datetime.now().timestamp() // 900)
+    )
+    _progress_bar.progress(30, text="Daily history loaded. Fetching live prices…")
+
+    # Step 2: Live prices (parallelized)
     current_prices, price_times = _do_fetch_latest_prices(_tickers_tuple)
+    _progress_bar.progress(100, text="✅ All data loaded!")
+
+_loading_container.empty()
 
 if daily_prices.empty:
     st.error("Could not fetch daily price history. Please check your internet connection.")
