@@ -20,9 +20,11 @@ st.set_page_config(
 )
 
 # Deep Dive Selection State Initialization
+_jump_to_deep_dive = False
 if "participant" in st.query_params:
     st.session_state["deep_dive_selection"] = st.query_params["participant"]
     del st.query_params["participant"]
+    _jump_to_deep_dive = True
 
 # Theme Initialization
 if "theme_setting" not in st.session_state:
@@ -538,6 +540,27 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "🏆 Overall Leaderboard", "📈 Daily Leaderboard", "📅 Monthly Leaderboard", 
     "📊 Benchmarks", "📆 Monthly Breakdown", "🔍 Deep Dive",
 ])
+
+if _jump_to_deep_dive:
+    import streamlit.components.v1 as components
+    components.html("""
+    <script>
+    const clickDeepDiveTab = () => {
+        const tabs = window.parent.document.querySelectorAll('button[data-baseweb="tab"]');
+        for (const tab of tabs) {
+            if (tab.textContent.includes('Deep Dive')) {
+                tab.click();
+                return true;
+            }
+        }
+        return false;
+    };
+    const interval = setInterval(() => {
+        if (clickDeepDiveTab()) clearInterval(interval);
+    }, 100);
+    setTimeout(() => clearInterval(interval), 5000);
+    </script>
+    """, height=0, width=0)
 
 # ══════════════════════════════════════════════
 # TAB 1: OVERALL LEADERBOARD
