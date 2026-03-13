@@ -433,80 +433,88 @@ if missing_from_baseline:
     except Exception: pass
 
 # ─── Loading UI ───
-_loading_container = st.empty()
-with _loading_container.container():
-    st.markdown("""
-    <div style="background:var(--card-bg);border:1px solid var(--card-border);border-radius:16px;
-                padding:32px;text-align:center;margin:20px 0;backdrop-filter:blur(10px);">
-        <div style="font-family:'Space Mono',monospace;font-size:11px;letter-spacing:4px;
-                    color:var(--text-muted);text-transform:uppercase;margin-bottom:12px;">📡 Loading Market Data</div>
-        <div style="font-family:'Syne',sans-serif;font-size:22px;font-weight:700;
-                    color:var(--text-main);margin-bottom:4px;">Fetching live prices…</div>
-        <div style="font-family:'Space Mono',monospace;font-size:12px;color:var(--text-muted);">
-            Downloading data for <strong>{len(_tickers_tuple)}</strong> tickers
+import threading, time
+
+if _jump_to_deep_dive:
+    # Data is already cached from initial load — fetch directly, no animation
+    daily_prices, missing_tickers = fetch_daily_history(
+        _tickers_tuple, ANCHOR_DATE, END_DATE,
+        _cache_bucket=int(datetime.now().timestamp() // 900)
+    )
+    current_prices, price_times = _do_fetch_latest_prices(_tickers_tuple)
+else:
+    _loading_container = st.empty()
+    with _loading_container.container():
+        st.markdown("""
+        <div style="background:var(--card-bg);border:1px solid var(--card-border);border-radius:16px;
+                    padding:32px;text-align:center;margin:20px 0;backdrop-filter:blur(10px);">
+            <div style="font-family:'Space Mono',monospace;font-size:11px;letter-spacing:4px;
+                        color:var(--text-muted);text-transform:uppercase;margin-bottom:12px;">📡 Loading Market Data</div>
+            <div style="font-family:'Syne',sans-serif;font-size:22px;font-weight:700;
+                        color:var(--text-main);margin-bottom:4px;">Fetching live prices…</div>
+            <div style="font-family:'Space Mono',monospace;font-size:12px;color:var(--text-muted);">
+                Downloading data for <strong>{len(_tickers_tuple)}</strong> tickers
+            </div>
         </div>
-    </div>
-    """.replace("{len(_tickers_tuple)}", str(len(_tickers_tuple))), unsafe_allow_html=True)
-    _progress_bar = st.progress(0, text="Fetching daily price history…")
+        """.replace("{len(_tickers_tuple)}", str(len(_tickers_tuple))), unsafe_allow_html=True)
+        _progress_bar = st.progress(0, text="Fetching daily price history…")
 
-    import threading, time
+        # Step 1: Daily history (bulk download) — animate 0% → 30%
+        _hist_done = threading.Event()
+        _hist_result = {}
 
-    # Step 1: Daily history (bulk download) — animate 0% → 30%
-    _hist_done = threading.Event()
-    _hist_result = {}
+        def _bg_hist():
+            _hist_result["prices"], _hist_result["missing"] = fetch_daily_history(
+                _tickers_tuple, ANCHOR_DATE, END_DATE,
+                _cache_bucket=int(datetime.now().timestamp() // 900)
+            )
+            _hist_done.set()
 
-    def _bg_hist():
-        _hist_result["prices"], _hist_result["missing"] = fetch_daily_history(
-            _tickers_tuple, ANCHOR_DATE, END_DATE,
-            _cache_bucket=int(datetime.now().timestamp() // 900)
-        )
-        _hist_done.set()
+        threading.Thread(target=_bg_hist, daemon=True).start()
 
-    threading.Thread(target=_bg_hist, daemon=True).start()
+        _pct = 0
+        while not _hist_done.is_set():
+            _hist_done.wait(timeout=0.15)
+            if _pct < 28:
+                _pct = min(_pct + 1, 28)
+                _progress_bar.progress(_pct, text=f"Fetching daily price history… {_pct}%")
 
-    _pct = 0
-    while not _hist_done.is_set():
-        _hist_done.wait(timeout=0.15)
-        if _pct < 28:
-            _pct = min(_pct + 1, 28)
-            _progress_bar.progress(_pct, text=f"Fetching daily price history… {_pct}%")
+        daily_prices, missing_tickers = _hist_result["prices"], _hist_result["missing"]
 
-    daily_prices, missing_tickers = _hist_result["prices"], _hist_result["missing"]
+        # Ramp to 30%
+        for _p in range(_pct + 1, 31):
+            _progress_bar.progress(_p, text=f"Daily history loaded… {_p}%")
+            time.sleep(0.01)
+        _pct = 30
+        _progress_bar.progress(30, text="Daily history loaded. Fetching live prices…")
 
-    # Ramp to 30%
-    for _p in range(_pct + 1, 31):
-        _progress_bar.progress(_p, text=f"Daily history loaded… {_p}%")
-        time.sleep(0.01)
-    _pct = 30
-    _progress_bar.progress(30, text="Daily history loaded. Fetching live prices…")
+        # Step 2: Live prices (parallelized) — animate 30% → 95%
+        _fetch_done = threading.Event()
+        _fetch_result = {}
 
-    # Step 2: Live prices (parallelized) — animate 30% → 95%
-    _fetch_done = threading.Event()
-    _fetch_result = {}
+        def _bg_fetch():
+            _fetch_result["prices"], _fetch_result["times"] = _do_fetch_latest_prices(_tickers_tuple)
+            _fetch_done.set()
 
-    def _bg_fetch():
-        _fetch_result["prices"], _fetch_result["times"] = _do_fetch_latest_prices(_tickers_tuple)
-        _fetch_done.set()
+        threading.Thread(target=_bg_fetch, daemon=True).start()
 
-    threading.Thread(target=_bg_fetch, daemon=True).start()
+        while not _fetch_done.is_set():
+            _fetch_done.wait(timeout=0.15)
+            if _pct < 95:
+                _pct = min(_pct + 1, 95)
+                _progress_bar.progress(_pct, text=f"Fetching live prices… {_pct}%")
 
-    while not _fetch_done.is_set():
-        _fetch_done.wait(timeout=0.15)
-        if _pct < 95:
-            _pct = min(_pct + 1, 95)
-            _progress_bar.progress(_pct, text=f"Fetching live prices… {_pct}%")
+        current_prices, price_times = _fetch_result["prices"], _fetch_result["times"]
 
-    current_prices, price_times = _fetch_result["prices"], _fetch_result["times"]
+        # Ramp to 100%
+        for _p in range(_pct + 1, 101):
+            _progress_bar.progress(_p, text=f"Finalizing… {_p}%")
+            time.sleep(0.01)
 
-    # Ramp to 100%
-    for _p in range(_pct + 1, 101):
-        _progress_bar.progress(_p, text=f"Finalizing… {_p}%")
-        time.sleep(0.01)
+        _progress_bar.progress(100, text="✅ All data loaded!")
+        time.sleep(0.8)
 
-    _progress_bar.progress(100, text="✅ All data loaded!")
-    time.sleep(0.8)
-
-_loading_container.empty()
+    _loading_container.empty()
 
 if daily_prices.empty:
     st.error("Could not fetch daily price history. Please check your internet connection.")
@@ -582,6 +590,10 @@ st.markdown(
 # ─────────────────────────────────────────────
 # TABS
 # ─────────────────────────────────────────────
+if _jump_to_deep_dive:
+    # Hide ENTIRE tabs container (header + content) until Deep Dive is selected
+    st.markdown('<style id="deep-dive-hide">.stTabs { opacity: 0 !important; }</style>', unsafe_allow_html=True)
+
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "🏆 Overall Leaderboard", "📈 Daily Leaderboard", "📅 Monthly Leaderboard", 
     "📊 Benchmarks", "📆 Monthly Breakdown", "🔍 Deep Dive",
@@ -591,20 +603,41 @@ if _jump_to_deep_dive:
     import streamlit.components.v1 as components
     components.html("""
     <script>
-    const clickDeepDiveTab = () => {
-        const tabs = window.parent.document.querySelectorAll('button[data-baseweb="tab"]');
-        for (const tab of tabs) {
-            if (tab.textContent.includes('Deep Dive')) {
-                tab.click();
-                return true;
+    (function() {
+        const doc = window.parent.document;
+        const clickDeepDiveTab = () => {
+            const tabs = doc.querySelectorAll('button[data-baseweb="tab"]');
+            for (const tab of tabs) {
+                if (tab.textContent.includes('Deep Dive')) {
+                    tab.click();
+                    // Wait for Streamlit to process the tab switch, then reveal
+                    requestAnimationFrame(() => {
+                        requestAnimationFrame(() => {
+                            const hideStyle = doc.getElementById('deep-dive-hide') || 
+                                [...doc.querySelectorAll('style')].find(s => s.textContent.includes('deep-dive-hide') || (s.textContent.includes('.stTabs') && s.textContent.includes('opacity: 0')));
+                            if (hideStyle) hideStyle.remove();
+                            // Also remove any matching style tags
+                            doc.querySelectorAll('style').forEach(s => {
+                                if (s.textContent.includes('.stTabs') && s.textContent.includes('opacity: 0')) s.remove();
+                            });
+                        });
+                    });
+                    return true;
+                }
             }
-        }
-        return false;
-    };
-    const interval = setInterval(() => {
-        if (clickDeepDiveTab()) clearInterval(interval);
-    }, 100);
-    setTimeout(() => clearInterval(interval), 5000);
+            return false;
+        };
+        const interval = setInterval(() => {
+            if (clickDeepDiveTab()) clearInterval(interval);
+        }, 20);
+        setTimeout(() => {
+            clearInterval(interval);
+            // Failsafe: always reveal after 2s
+            doc.querySelectorAll('style').forEach(s => {
+                if (s.textContent.includes('.stTabs') && s.textContent.includes('opacity: 0')) s.remove();
+            });
+        }, 2000);
+    })();
     </script>
     """, height=0, width=0)
 
@@ -716,7 +749,7 @@ with tab2:
     st.markdown('<div class="section-header">Full Today\'s Ranking</div>', unsafe_allow_html=True)
     today_df = pd.DataFrame({
         "Rank": range(1, len(sorted_today) + 1),
-        "Participant": sorted_today.index,
+        "Participant": [f'<a href="?participant={p}" target="_self" style="color:var(--text-main);text-decoration:none;font-weight:700;transition:color 0.2s;" onmouseover="this.style.color=\'var(--text-value)\'" onmouseout="this.style.color=\'var(--text-main)\'">{p}</a>' for p in sorted_today.index],
         "Today's Return": sorted_today.map("{:+.2f}%".format),
         "Live Portfolio": current_portfolio[sorted_today.index].map("${:,.2f}".format),
         "Type": [("🤖 AI" if p in AI_PARTICIPANTS else "👤 Human") for p in sorted_today.index],
@@ -771,7 +804,7 @@ with tab3:
     st.markdown('<div class="section-header">Full MTD Ranking</div>', unsafe_allow_html=True)
     mtd_df = pd.DataFrame({
         "Rank": range(1, len(sorted_mtd) + 1),
-        "Participant": sorted_mtd.index,
+        "Participant": [f'<a href="?participant={p}" target="_self" style="color:var(--text-main);text-decoration:none;font-weight:700;transition:color 0.2s;" onmouseover="this.style.color=\'var(--text-value)\'" onmouseout="this.style.color=\'var(--text-main)\'">{p}</a>' for p in sorted_mtd.index],
         "MTD Return": sorted_mtd.map("{:+.2f}%".format),
         "Live Portfolio": current_portfolio[sorted_mtd.index].map("${:,.2f}".format),
         "Type": [("🤖 AI" if p in AI_PARTICIPANTS else "👤 Human") for p in sorted_mtd.index],
